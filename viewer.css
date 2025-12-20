@@ -608,3 +608,98 @@
     color: var(--text-primary);
     font-weight: 500;
 }
+
+/* Dual-handle range slider */
+.dual-range-container {
+    position: relative;
+    width: 100%;
+    height: 14px;
+    background: #ffffff;
+    border-radius: 7px;
+}
+.window-range-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+}
+.window-range-row > label {
+    padding: 0;
+    margin: 0;
+}
+.window-range-body {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 100%;
+}
+.window-range-label {
+    font-size: 11px;
+    color: var(--text-dim);
+}
+.window-reset-btn {
+    align-self: flex-start;
+    padding: 6px 10px;
+    background: var(--hover-bg);
+    border: 1px solid var(--input-border);
+    color: var(--text-primary);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: all 0.2s ease;
+}
+.window-reset-btn:hover {
+    border-color: var(--accent-primary);
+    color: var(--accent-primary);
+}
+.dual-range {
+    -webkit-appearance: none;
+    appearance: none;
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    pointer-events: none;
+    height: 10px;
+}
+.dual-range::-webkit-slider-runnable-track {
+    height: 6px;
+    background: transparent;
+    border: none;
+}
+.dual-range::-moz-range-track {
+    height: 6px;
+    background: transparent;
+    border: none;
+}
+.dual-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #7a7a7a;
+    border: 1px solid #606060;
+    box-shadow: 0 0 0 2px #404040;
+    pointer-events: auto;
+    position: relative;
+    z-index: 2;
+}
+.dual-range::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #7a7a7a;
+    border: 1px solid #606060;
+    box-shadow: 0 0 0 2px #404040;
+    pointer-events: auto;
+    position: relative;
+    z-index: 2;
+}
+.dual-range.dual-range-max {
+    z-index: 3;
+}

@@ -15,6 +15,27 @@ let RTSSMarks = [];
 let roiMasks = {}; // cache: roiName -> { mask: Uint8Array, width, height, depth, bbox }
 let roiContoursSag = {}; // roiName -> Map(sliceX -> segments)
 let roiContoursCor = {}; // roiName -> Map(sliceY -> segments)
+// Tab + MR padding workflow state
+let activeTab = 'rt';
+let mrSeries = [];
+let mrSeriesMap = {};
+let mrRegistration = null;
+let mrResampledSlices = [];
+let mrBlendedSlices = [];
+let mrPreviewActive = false;
+let mrVolume = null;
+let mrStats = null;
+let mrSelectedSeriesUID = null;
+let currentCTSeries = null;
+let currentMRSeries = null;
+let mrRegistrations = [];
+let mrToCtMatrix = null;
+let mrBlendFraction = 1.0; // 0=CT, 1=MR
+let ctWindowRange = { min: -160, max: 240 }; // defaults from 400/40
+let mrWindowRange = { min: -200, max: 800 };
+let ctDefaultWindowRange = { min: -160, max: 240 };
+let mrDefaultWindowRange = null;
+let mrWindowRebuildTimer = null;
 
 // Prevent external hooks from throwing (no-op placeholders)
 window.refreshMarkFromSeries = window.refreshMarkFromSeries || function(){};
@@ -82,6 +103,79 @@ let previewRestoreState = null;
 let previewRestoreToggle = null;
 let previewRegenTimer = null;
 
+// Tab switching between RT burn and MR padding
+function switchTab(tab) {
+    const target = (tab === 'mr') ? 'mr' : 'rt';
+    activeTab = target;
+    const rtBtn = document.getElementById('tabRtBtn');
+    const mrBtn = document.getElementById('tabMrBtn');
+    rtBtn && rtBtn.classList.toggle('active', target === 'rt');
+    mrBtn && mrBtn.classList.toggle('active', target === 'mr');
+
+    const rtStruct = document.getElementById('rtStructureSection');
+    if (rtStruct) rtStruct.style.display = (target === 'rt') ? 'block' : 'none';
+    const mrSummary = document.getElementById('mrSummarySection');
+    if (mrSummary) mrSummary.style.display = (target === 'mr') ? 'block' : 'none';
+    const rtControls = document.getElementById('rtControls');
+    if (rtControls) rtControls.style.display = (target === 'rt') ? 'block' : 'none';
+    const mrControls = document.getElementById('mrControls');
+    if (mrControls) mrControls.style.display = (target === 'mr') ? 'block' : 'none';
+    const label = document.getElementById('controlsViewportLabel');
+    if (label) label.textContent = (target === 'mr') ? 'MR Padding Controls' : 'Burn-In Controls';
+    if (target === 'mr') {
+        const out = document.getElementById('mrOutputName');
+        if (out && !out.value) out.value = MR_DEFAULT_OUTPUT_NAME;
+    }
+    const uploadTitle = document.getElementById('ctUploadTitle');
+    const uploadHint = document.getElementById('ctUploadHint');
+    if (target === 'mr') {
+        if (uploadTitle) uploadTitle.textContent = 'Drop CT + MR + REG DICOM here';
+        if (uploadHint) uploadHint.textContent = 'Single folder or selection containing CT, MR, and rigid REG (SRO) files';
+        const blendSlider = document.getElementById('mrBlendSlider');
+        const blendValue = document.getElementById('mrBlendValue');
+        if (blendSlider) blendSlider.value = Math.round(mrBlendFraction * 100);
+        if (blendValue) blendValue.textContent = `${Math.round(mrBlendFraction * 100)}% MR`;
+        const blendRow = document.getElementById('mrBlendRow');
+        if (blendRow) blendRow.style.display = 'flex';
+        const normToggle = document.getElementById('mrUseNormalization');
+        if (normToggle) {
+            normToggle.checked = false;
+            normToggle.disabled = true;
+            normToggle.title = 'MR uses raw intensities (normalization disabled)';
+        }
+        syncWindowInputsToActiveTab();
+        applyWindowForActiveTab();
+        const mrRow = document.getElementById('mrWindowRow');
+        const ctRow = document.getElementById('ctWindowRow');
+        if (mrRow) mrRow.style.display = 'none'; // MR WL hidden; display uses CT
+        if (ctRow) ctRow.style.display = 'flex';
+    } else {
+        if (uploadTitle) uploadTitle.textContent = 'Drop CT + RS DICOM here';
+        if (uploadHint) uploadHint.textContent = 'or click to browse CT + RS';
+        const blendRow = document.getElementById('mrBlendRow');
+        if (blendRow) blendRow.style.display = 'none';
+        const mrRow = document.getElementById('mrWindowRow');
+        if (mrRow) mrRow.style.display = 'none'; // RT burn only needs CT window control
+        const ctRow = document.getElementById('ctWindowRow');
+        if (ctRow) ctRow.style.display = 'flex';
+    }
+
+    // Avoid RT preview artifacts when switching tabs
+    if (target === 'mr' && window.previewMode) {
+        clearPreview();
+    }
+
+    // Toggle preview banner text for MR if needed
+    const banner = document.getElementById('previewBanner');
+    if (banner) banner.textContent = (target === 'mr') ? 'MR Pad Preview' : 'Preview Mode';
+
+    // Refresh viewer for the active tab
+    syncWindowInputsToActiveTab();
+    applyWindowForActiveTab();
+    displaySimpleViewer();
+    refreshMrStatusUI();
+}
+
 // DICOM Tag constants
 const Tag = {
     StudyInstanceUID: 'x0020000d',
@@ -96,6 +190,7 @@ const Tag = {
     PixelSpacing: 'x00280030',
     ImagePositionPatient: 'x00200032',
     ImageOrientationPatient: 'x00200037',
+    FrameOfReferenceUID: 'x00200052',
     RescaleIntercept: 'x00281052',
     RescaleSlope: 'x00281053',
     WindowCenter: 'x00281050',
@@ -114,6 +209,71 @@ const Tag = {
     ReferencedROINumber: 'x30060084'
 };
 
+function isRegistrationDataset(dataSet) {
+    try {
+        const modality = dataSet?.string?.(Tag.Modality);
+        if (modality && modality.toUpperCase() === 'REG') return true;
+    } catch (e) { /* ignore */ }
+    try {
+        const sop = dataSet?.string?.('x00080016');
+        if (sop && sop.startsWith('1.2.840.10008.5.1.4.1.1.66')) return true;
+    } catch (e) { /* ignore */ }
+    try {
+        if (dataSet?.elements?.x00700308) return true; // RegistrationSequence
+    } catch (e) { /* ignore */ }
+    return false;
+}
+
+function parseRegistrationForList(dataSet) {
+    const list = [];
+    try {
+        const seq = dataSet?.elements?.x00700308?.items || [];
+        seq.forEach(item => {
+            const forVal = item.dataSet?.string?.('x00200052');
+            if (forVal) list.push(forVal);
+        });
+    } catch (e) { /* ignore */ }
+    return list;
+}
+
+function parseRegistrationTransforms(dataSet) {
+    const transforms = [];
+    const parseVal = (val) => {
+        if (Array.isArray(val)) {
+            const arr = val.map(v => parseFloat(v)).filter(Number.isFinite);
+            return arr.length === 16 ? arr : null;
+        }
+        if (typeof val === 'string') {
+            const arr = val.split('\\').map(v => parseFloat(v)).filter(Number.isFinite);
+            return arr.length === 16 ? arr : null;
+        }
+        return null;
+    };
+    try {
+        const regSeq = dataSet?.elements?.x00700308?.items || [];
+        for (const item of regSeq) {
+            const forUID = item.dataSet?.string?.('x00200052') || null;
+            const mrs = item.dataSet?.elements?.x00700309?.items || [];
+            for (const mi of mrs) {
+                const mseq = mi.dataSet?.elements?.x0070030a?.items || [];
+                for (const mat of mseq) {
+                    const ds = mat.dataSet;
+                    let matArr = null;
+                    if (ds?.elements?.x300600c6) {
+                        matArr = parseVal(ds.string?.('x300600c6')) || parseVal(ds.elements.x300600c6.value);
+                    }
+                    if (!matArr) matArr = parseVal(ds?.string?.('x0070030c'));
+                    if (matArr) {
+                        transforms.push({ forUID, matrix: matArr });
+                        continue;
+                    }
+                }
+            }
+        }
+    } catch (e) { /* ignore */ }
+    return transforms;
+}
+
 // HU Presets
 const HU_PRESETS = {
     "Air (-1000 HU)": -1000,
@@ -127,6 +287,8 @@ const HU_PRESETS = {
 
 // Debug toggle
 const DEBUG = false;
+const VERSION_DEFAULT = '1.3';
+const MR_DEFAULT_OUTPUT_NAME = 'CT_MRPad_v1.3';
 
 const TEXT_FONT_PT_DEFAULT = 12;
 // Reduce footer font size by ~2 points (~2.67 px from previous 18px -> ~15px)
@@ -182,20 +344,85 @@ function getDefaultSeriesName() {
     }
 }
 
+let mrSeriesSelectResolver = null;
+function openMrSeriesModal(options) {
+    return new Promise((resolve) => {
+        const overlay = document.getElementById('mrSeriesModal');
+        const list = document.getElementById('mrSeriesList');
+        if (!overlay || !list) return resolve(null);
+        list.innerHTML = '';
+        options.forEach(opt => {
+            const btn = document.createElement('button');
+            btn.className = 'mr-series-option';
+            btn.innerHTML = `${opt.desc || 'MR Series'}<span class="mr-series-meta">Slices: ${opt.slices}</span>`;
+            btn.onclick = () => {
+                closeMrSeriesModal();
+                resolve(opt.uid);
+            };
+            list.appendChild(btn);
+        });
+        overlay.style.display = 'flex';
+        mrSeriesSelectResolver = resolve;
+    });
+}
+function closeMrSeriesModal() {
+    const overlay = document.getElementById('mrSeriesModal');
+    if (overlay) overlay.style.display = 'none';
+    if (mrSeriesSelectResolver) {
+        mrSeriesSelectResolver(null);
+        mrSeriesSelectResolver = null;
+    }
+}
+
+async function sniffModalities(files, limit = Infinity) {
+    const found = new Set();
+    const slice = (limit === Infinity) ? files : files.slice(0, limit);
+    for (const file of slice) {
+        try {
+            const buf = await file.arrayBuffer();
+            const byteArray = new Uint8Array(buf);
+            const ds = dicomParser.parseDicom(byteArray);
+            const mod = ds?.string?.(Tag.Modality);
+            if (mod) found.add(mod.toUpperCase());
+            if (found.has('MR') && found.has('CT')) break;
+        } catch (e) { /* ignore */ }
+    }
+    return found;
+}
+
 // Handle file selection
 document.getElementById('dicomFiles').addEventListener('change', async function(e) {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
 
     // If something is already loaded, confirm and clear before loading new
-    const hasLoaded = (ctFiles && ctFiles.length) || (processedCTData && processedCTData.length) || window.simpleViewerData;
+    const hasLoaded = (ctFiles && ctFiles.length) || (processedCTData && processedCTData.length) || window.simpleViewerData || (mrSeries && mrSeries.length);
     if (hasLoaded) {
         const ok = window.confirm('Open a new DICOM set? This will clear the current images and overlays.');
         if (!ok) { e.target.value = ''; return; }
         clearAllData();
     }
 
-    await processDICOMFiles(files);
+    if (activeTab === 'mr') {
+        await processMRPackage(files);
+    } else {
+        const modalities = await sniffModalities(files);
+        if (modalities.has('MR')) {
+            const goMr = window.confirm('MR images detected. Switch to MR Padding workspace?');
+            if (goMr) {
+                clearAllData();
+                switchTab('mr');
+                await processMRPackage(files);
+                e.target.value = '';
+                return;
+            } else if (!modalities.has('CT')) {
+                showMessage('error', 'No CT series detected. MR requires the MR Padding tab.');
+                e.target.value = '';
+                return;
+            }
+        }
+        await processDICOMFiles(files);
+    }
 });
 
 function clearCanvasById(id) {
@@ -224,6 +451,15 @@ function clearAllData() {
         window.previewOverlays = [];
         window.showBurnValidation = false;
         window.lastBurnNames = [];
+        // MR padding state
+        mrSeries = [];
+        mrSeriesMap = {};
+        mrRegistration = null;
+        mrResampledSlices = [];
+        mrPreviewActive = false;
+        mrVolume = null;
+        mrStats = null;
+        mrSelectedSeriesUID = null;
 
         // Reset viewport state
         if (typeof viewportState !== 'undefined') {
@@ -244,6 +480,7 @@ function clearAllData() {
         if (filesLoadedHeader) filesLoadedHeader.textContent = 'No files loaded';
         const status = document.getElementById('statusMessage');
         if (status) status.textContent = '';
+        refreshMrStatusUI();
 
         // Clear canvases
         clearCanvasById('viewport-axial');
@@ -261,6 +498,12 @@ async function processDICOMFiles(files) {
     ctSeriesMap = {};
     rtstructFiles = [];
     roiData = [];
+    mrResampledSlices = [];
+    mrPreviewActive = false;
+    mrVolume = null;
+    mrStats = null;
+    currentCTSeries = null;
+    currentMRSeries = null;
     // Reset parsed RTSTRUCT marks
     if (window.RTSSMarks) {
         window.RTSSMarks.length = 0;
@@ -407,6 +650,12 @@ async function processDICOMFiles(files) {
         filesLoadedHeader.textContent = rtstructFile ? `${ctFiles.length} CT${seriesName}, 1 RTSTRUCT loaded` : `${ctFiles.length} CT${seriesName} loaded`;
     }
     updateStatus('Files loaded successfully');
+
+    currentCTSeries = {
+        seriesUID: chosenSeriesUID,
+        forUID: firstCT?.string?.(Tag.FrameOfReferenceUID) || null
+    };
+    setDefaultCTWindow(firstCT);
     
     // Extract ROI information if RTSTRUCT provided
     if (rtstructFile) {
@@ -421,11 +670,1064 @@ async function processDICOMFiles(files) {
     setTimeout(() => {
         openViewerForPreview();
     }, 100);
-    
+
     // Ensure viewport interactions are set up after a brief delay
     setTimeout(() => {
         setupViewportInteractions();
     }, 500);
+
+    refreshMrStatusUI();
+}
+
+function refreshMrStatusUI() {
+    const setText = (id, text) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text;
+    };
+    setText('mrCtStatus', (ctFiles && ctFiles.length) ? `CT: ${ctFiles.length} slices` : 'CT: not loaded');
+    setText('mrImageStatus', (mrSeries && mrSeries.length) ? `MR: ${mrSeries.length} slices` : 'MR: not loaded');
+    setText('mrRegStatus', mrRegistration ? 'Reg: loaded' : (mrRegistrations.length ? `Reg: ${mrRegistrations.length} found` : 'Reg: not loaded'));
+    if (mrStats) {
+        const pct = mrStats.percentileUsed || 95;
+        let pctVal = mrStats[`p${pct}`];
+        if ((pctVal === undefined || pctVal === null) && mrStats.percentileUsed === pct && mrStats.pCustom !== undefined) {
+            pctVal = mrStats.pCustom;
+        }
+        const desc = (pctVal !== undefined && pctVal !== null)
+            ? `Raw MR: min ${mrStats.min.toFixed(0)}, p${pct} ${pctVal.toFixed(0)}`
+            : `Raw MR: min ${mrStats.min.toFixed(0)}`;
+        setText('mrNormStatus', desc);
+    } else {
+        setText('mrNormStatus', 'Raw MR: —');
+    }
+    updateMrPairLink();
+}
+
+function updateMRProgress(value, text = '') {
+    const fill = document.getElementById('mrProgressFill');
+    if (fill) fill.style.width = `${Math.max(0, Math.min(100, value || 0))}%`;
+    const txt = document.getElementById('mrProgressText');
+    if (txt) txt.textContent = text || '';
+}
+
+function updateMrStatusText(message) {
+    const el = document.getElementById('mrStatusText');
+    if (el) el.textContent = message;
+}
+
+function onMrBlendChange(val) {
+    const pct = Math.max(0, Math.min(100, parseInt(val || '0', 10)));
+    mrBlendFraction = pct / 100;
+    const label = document.getElementById('mrBlendValue');
+    if (label) label.textContent = `${pct}% MR`;
+    rebuildMrBlend();
+    window.volumeData = null; // force MPR rebuild with new blend
+    displaySimpleViewer();
+}
+
+function shortUID(uid) {
+    if (!uid) return '—';
+    const parts = String(uid).split('.');
+    if (parts.length <= 3) return uid;
+    return `…${parts.slice(-3).join('.')}`;
+}
+
+function updateMrPairLink() {
+    const el = document.getElementById('mrPairLink');
+    const listEl = document.getElementById('mrPairList');
+    if (!el) return;
+    const ctFor = currentCTSeries?.forUID;
+    const mrFor = currentMRSeries?.forUID;
+    const regFor = mrRegistration?.forList || [];
+    if (!ctFor && !mrFor) {
+        el.textContent = 'No CT/MR pairing yet.';
+        el.style.color = 'var(--text-secondary)';
+        if (listEl) listEl.textContent = '';
+        return;
+    }
+    if (!mrRegistration) {
+        el.textContent = 'CT/MR loaded. REG missing.';
+        el.style.color = 'var(--warning)';
+        if (listEl) listEl.textContent = '';
+        return;
+    }
+    const ctMatch = ctFor ? regFor.includes(ctFor) : false;
+    const mrMatch = mrFor ? regFor.includes(mrFor) : false;
+    if (ctMatch && mrMatch) {
+        el.textContent = `REG links CT FOR ${shortUID(ctFor)} ↔ MR FOR ${shortUID(mrFor)}`;
+        el.style.color = 'var(--success)';
+    } else {
+        const regText = regFor.length ? regFor.map(shortUID).join(', ') : 'none';
+        el.textContent = `REG FORs (${regText}) do not match CT ${shortUID(ctFor)} / MR ${shortUID(mrFor)}`;
+        el.style.color = 'var(--error)';
+    }
+    if (listEl) {
+        if (!mrRegistrations || mrRegistrations.length <= 1) {
+            listEl.textContent = '';
+        } else {
+            const parts = mrRegistrations.map((r, idx) => {
+                const rf = (r.forList || []).map(shortUID).join(' ↔ ') || '—';
+                const hasMatrix = r.matrix || (r.transforms && r.transforms.length);
+                return `#${idx + 1}: ${rf}${hasMatrix ? '' : ' (no matrix)'}`;
+            });
+            listEl.textContent = `Available REG links: ${parts.join(' | ')}`;
+        }
+    }
+}
+
+// ---- MR Padding Flow ----
+async function processMRPackage(files) {
+    mrSeries = [];
+    mrSeriesMap = {};
+    mrVolume = null;
+    mrStats = null;
+    mrResampledSlices = [];
+    mrBlendedSlices = [];
+    mrPreviewActive = false;
+    mrRegistration = null;
+    mrRegistrations = [];
+    mrToCtMatrix = null;
+    currentCTSeries = null;
+    currentMRSeries = null;
+
+    ctFiles = [];
+    ctSeriesMap = {};
+    roiData = [];
+    if (window.RTSSMarks) window.RTSSMarks.length = 0;
+    roiMasks = {};
+    roiContoursSag = {};
+    roiContoursCor = {};
+
+    updateMrStatusText('Processing mixed CT/MR/REG files...');
+    updateMRProgress(0, '');
+
+    for (const file of files) {
+        try {
+            const arrayBuffer = await file.arrayBuffer();
+        const byteArray = new Uint8Array(arrayBuffer);
+        const dataSet = dicomParser.parseDicom(byteArray);
+        const modalityValue = dataSet.string(Tag.Modality);
+        if (modalityValue === 'CT') {
+            if (dataSet.elements && dataSet.elements.x7fe00010) {
+                    const seriesUID = dataSet.string(Tag.SeriesInstanceUID) || 'UNKNOWN';
+                    const seriesDesc = dataSet.string('x0008103e') || 'CT Series';
+                    const entry = { file, dataSet, arrayBuffer, byteArray };
+                    if (!ctSeriesMap[seriesUID]) ctSeriesMap[seriesUID] = { seriesUID, desc: seriesDesc, slices: [] };
+                    ctSeriesMap[seriesUID].slices.push(entry);
+                }
+            } else if (modalityValue === 'MR') {
+                if (dataSet.elements && dataSet.elements.x7fe00010) {
+                    const seriesUID = dataSet.string(Tag.SeriesInstanceUID) || 'UNKNOWN';
+                    const seriesDesc = dataSet.string('x0008103e') || 'MR Series';
+                    const entry = { file, dataSet, arrayBuffer, byteArray };
+                    if (!mrSeriesMap[seriesUID]) mrSeriesMap[seriesUID] = { seriesUID, desc: seriesDesc, slices: [] };
+                    mrSeriesMap[seriesUID].slices.push(entry);
+                }
+            } else if (isRegistrationDataset(dataSet)) {
+                const matrix = extractRegistrationMatrix(dataSet);
+                const forList = parseRegistrationForList(dataSet);
+                const transforms = parseRegistrationTransforms(dataSet);
+                const reg = { file, dataSet, matrix, forList, transforms };
+                mrRegistrations.push(reg);
+                if (!mrRegistration && (matrix || (transforms && transforms.length))) {
+                    mrRegistration = reg;
+                }
+            }
+        } catch (err) {
+            console.error('Error reading DICOM file:', file?.name, err);
+        }
+    }
+
+    const ctKeys = Object.keys(ctSeriesMap);
+    if (!ctKeys.length) {
+        showMessage('error', 'No CT series found.');
+        refreshMrStatusUI();
+        return;
+    }
+    let chosenCT = ctKeys[0];
+    if (ctKeys.length > 1) {
+        let msg = 'Multiple CT series found. Enter number to open:\n';
+        ctKeys.forEach((uid, idx) => {
+            const s = ctSeriesMap[uid];
+            msg += `${idx + 1}) ${s.desc || 'CT'} | Slices: ${s.slices.length}\n`;
+        });
+        const ans = window.prompt(msg, '1');
+        const sel = Math.max(1, Math.min(ctKeys.length, parseInt(ans || '1')));
+        chosenCT = ctKeys[sel - 1];
+    }
+    ctFiles = sortSlicesByPosition(ctSeriesMap[chosenCT].slices);
+    const firstCT = ctFiles[0]?.dataSet;
+    currentCTSeries = {
+        seriesUID: chosenCT,
+        forUID: firstCT?.string?.(Tag.FrameOfReferenceUID) || null
+    };
+    if (firstCT) setDefaultCTWindow(firstCT);
+
+    const mrKeys = Object.keys(mrSeriesMap);
+    if (!mrKeys.length) {
+        showMessage('error', 'No MR series found.');
+        refreshMrStatusUI();
+        return;
+    }
+    let chosenMR = mrKeys[0];
+    if (mrKeys.length > 1) {
+        const opts = mrKeys.map(uid => ({
+            uid,
+            desc: mrSeriesMap[uid]?.desc || 'MR Series',
+            slices: mrSeriesMap[uid]?.slices?.length || 0
+        }));
+        const sel = await openMrSeriesModal(opts);
+        if (sel && mrKeys.includes(sel)) {
+            chosenMR = sel;
+        }
+    }
+    mrSelectedSeriesUID = chosenMR;
+    mrSeries = sortSlicesByPosition(mrSeriesMap[chosenMR].slices);
+    mrVolume = buildVolumeFromSlices(mrSeries, 'MR');
+    mrStats = computeVolumeStats(mrVolume, parseFloat(document.getElementById('mrNormPercentile')?.value) || 95);
+    setDefaultMRWindow(mrStats, mrSeries[0]?.dataSet);
+    currentMRSeries = {
+        seriesUID: chosenMR,
+        forUID: mrSeries[0]?.dataSet?.string?.(Tag.FrameOfReferenceUID) || null
+    };
+
+    // Choose registration that links CT and MR if available
+    if (mrRegistrations.length) {
+        const ctFor = currentCTSeries?.forUID;
+        const mrFor = currentMRSeries?.forUID;
+        const regMatch = mrRegistrations.find(r => {
+            if (!r.forList || r.forList.length < 2) return false;
+            const hasCT = ctFor ? r.forList.includes(ctFor) : false;
+            const hasMR = mrFor ? r.forList.includes(mrFor) : false;
+            return hasCT && hasMR;
+        }) || mrRegistrations[0];
+        mrRegistration = regMatch;
+    }
+
+    // Update header patient info using CT
+    const patientId = firstCT?.string?.(Tag.PatientID) || '—';
+    const patientName = firstCT?.string?.(Tag.PatientName) || '—';
+    const studyDate = firstCT?.string?.(Tag.StudyDate) || '';
+    if (document.getElementById('headerPatientId')) document.getElementById('headerPatientId').textContent = patientId;
+    if (document.getElementById('headerPatientName')) document.getElementById('headerPatientName').textContent = patientName;
+    if (studyDate && studyDate.length === 8) {
+        const formatted = `${studyDate.slice(0,4)}-${studyDate.slice(4,6)}-${studyDate.slice(6,8)}`;
+        const el = document.getElementById('headerStudyDate');
+        if (el) el.textContent = formatted;
+    }
+    const filesLoadedHeader = document.getElementById('filesLoadedHeader');
+    if (filesLoadedHeader) {
+        const seriesName = (ctSeriesMap[chosenCT]?.desc) ? ` [${ctSeriesMap[chosenCT].desc}]` : '';
+        const mrName = (mrSeriesMap[chosenMR]?.desc) ? ` [${mrSeriesMap[chosenMR].desc}]` : '';
+        const regText = mrRegistration ? ' + REG' : ' (REG missing)';
+        filesLoadedHeader.textContent = `${ctFiles.length} CT${seriesName}, ${mrSeries.length} MR${mrName}${regText}`;
+    }
+
+    // Reset viewer data
+    processedCTData = [];
+    window.volumeData = null;
+    window.simpleViewerData = null;
+    setTimeout(() => {
+        openViewerForPreview();
+    }, 100);
+    setTimeout(() => setupViewportInteractions(), 500);
+
+    // Reset blend to MR-heavy by default
+    mrBlendFraction = 1.0;
+    mrBlendedSlices = [];
+    const blendSlider = document.getElementById('mrBlendSlider');
+    const blendValue = document.getElementById('mrBlendValue');
+    if (blendSlider) blendSlider.value = 100;
+    if (blendValue) blendValue.textContent = '100% MR';
+    const blendRow = document.getElementById('mrBlendRow');
+    if (blendRow && activeTab === 'mr') blendRow.style.display = 'flex';
+
+    refreshMrStatusUI();
+    showMessage('success', 'Loaded CT + MR' + (mrRegistration ? ' + REG.' : '. REG missing.'));
+
+    // Auto-build fused preview when CT/MR/REG are matched to allow immediate visual check
+    try {
+        if (mrRegistration && currentCTSeries && currentMRSeries) {
+            await buildMRPreview(false);
+            updateMrStatusText('Preview: fused MR→CT (auto)');
+        }
+    } catch (e) {
+        console.warn('Auto MR preview failed:', e);
+    }
+}
+
+async function loadMRSeries(files) {
+    if (!files || files.length === 0) return;
+    mrSeries = [];
+    mrSeriesMap = {};
+    mrVolume = null;
+    mrStats = null;
+    mrResampledSlices = [];
+    mrPreviewActive = false;
+    currentMRSeries = null;
+    updateMrStatusText('Processing MR files...');
+    updateMRProgress(0, '');
+
+    for (const file of files) {
+        try {
+            const arrayBuffer = await file.arrayBuffer();
+            const byteArray = new Uint8Array(arrayBuffer);
+            const dataSet = dicomParser.parseDicom(byteArray);
+            const modalityValue = dataSet.string(Tag.Modality);
+            if (modalityValue === 'MR') {
+                if (dataSet.elements && dataSet.elements.x7fe00010) {
+                    const seriesUID = dataSet.string(Tag.SeriesInstanceUID) || 'UNKNOWN';
+                    const seriesDesc = dataSet.string('x0008103e') || 'MR Series';
+                    const entry = { file, dataSet, arrayBuffer, byteArray };
+                    if (!mrSeriesMap[seriesUID]) mrSeriesMap[seriesUID] = { seriesUID, desc: seriesDesc, slices: [] };
+                    mrSeriesMap[seriesUID].slices.push(entry);
+                }
+            }
+        } catch (err) {
+            console.error('Error reading MR DICOM file:', file?.name, err);
+        }
+    }
+
+    const seriesKeys = Object.keys(mrSeriesMap);
+    if (seriesKeys.length === 0) {
+        showMessage('error', 'No MR files found in the selected folder');
+        updateMrStatusText('No MR files found.');
+        refreshMrStatusUI();
+        return;
+    }
+
+    let chosenSeriesUID = seriesKeys[0];
+    if (seriesKeys.length > 1) {
+        const opts = seriesKeys.map(uid => ({
+            uid,
+            desc: mrSeriesMap[uid]?.desc || 'MR Series',
+            slices: mrSeriesMap[uid]?.slices?.length || 0
+        }));
+        const sel = await openMrSeriesModal(opts);
+        if (sel && seriesKeys.includes(sel)) chosenSeriesUID = sel;
+    }
+
+    mrSelectedSeriesUID = chosenSeriesUID;
+    mrSeries = sortSlicesByPosition(mrSeriesMap[chosenSeriesUID].slices);
+    updateStatus(`MR series loaded (${mrSeries.length} slices)`);
+    updateMrStatusText('MR series loaded. Computing stats...');
+
+    mrVolume = buildVolumeFromSlices(mrSeries, 'MR');
+    mrStats = computeVolumeStats(mrVolume, parseFloat(document.getElementById('mrNormPercentile')?.value) || 95);
+    setDefaultMRWindow(mrStats, mrSeries[0]?.dataSet);
+
+    currentMRSeries = {
+        seriesUID: mrSelectedSeriesUID,
+        forUID: mrSeries[0]?.dataSet?.string?.(Tag.FrameOfReferenceUID) || null
+    };
+
+    refreshMrStatusUI();
+    showMessage('success', `Loaded MR series (${mrSeries.length} slices).`);
+    if (activeTab === 'mr') {
+        window.volumeData = null;
+        displaySimpleViewer();
+    }
+}
+
+async function loadRegistrationFile(file) {
+    if (!file) return;
+    try {
+        const arrayBuffer = await file.arrayBuffer();
+        const byteArray = new Uint8Array(arrayBuffer);
+        const dataSet = dicomParser.parseDicom(byteArray);
+        const matrix = extractRegistrationMatrix(dataSet);
+        if (!matrix) {
+            showMessage('error', 'Registration matrix not found in DICOM');
+            updateMrStatusText('Registration not found in selected file.');
+            return;
+        }
+        const forList = parseRegistrationForList(dataSet);
+        const transforms = parseRegistrationTransforms(dataSet);
+        mrRegistration = { file, dataSet, matrix, forList, transforms };
+        mrPreviewActive = false;
+        mrResampledSlices = [];
+        window.volumeData = null;
+        showMessage('success', 'Registration loaded.');
+        updateMrStatusText('Registration loaded. Ready to preview.');
+        refreshMrStatusUI();
+    } catch (err) {
+        console.error('Registration load failed:', err);
+        showMessage('error', 'Failed to read registration DICOM.');
+        updateMrStatusText('Failed to read registration DICOM.');
+    }
+}
+
+function extractRegistrationMatrix(dataSet) {
+    if (!dataSet) return null;
+    const parseVal = (val) => {
+        if (Array.isArray(val)) {
+            const arr = val.map(v => parseFloat(v)).filter(Number.isFinite);
+            return arr.length === 16 ? arr : null;
+        }
+        if (typeof val === 'string') {
+            const arr = val.split('\\').map(v => parseFloat(v)).filter(Number.isFinite);
+            return arr.length === 16 ? arr : null;
+        }
+        return null;
+    };
+
+    // Direct lookup helpers
+    const tryString = (tag) => {
+        try {
+            const str = dataSet.string(tag);
+            const arr = parseVal(str);
+            if (arr) return arr;
+        } catch (e) { /* ignore */ }
+        return null;
+    };
+
+    // 1) Common tags on root
+    if (dataSet.elements?.x300600c6) {
+        const direct = tryString('x300600c6');
+        if (direct) return direct;
+    }
+    const candidateTags = ['x300600c6', 'x0070030a', 'x0070030c'];
+    for (const tag of candidateTags) {
+        const arr = tryString(tag);
+        if (arr) return arr;
+    }
+
+    // 2) Walk sequences explicitly (RegistrationSequence -> MatrixRegistrationSequence -> MatrixSequence)
+    try {
+        const regSeq = dataSet.elements?.x00700308?.items || [];
+        for (const item of regSeq) {
+            const mrs = item.dataSet?.elements?.x00700309?.items || [];
+            for (const mi of mrs) {
+                const mseq = mi.dataSet?.elements?.x0070030a?.items || [];
+                for (const mat of mseq) {
+                    // 3006,00C6 inside matrix item
+                    const ds = mat.dataSet;
+                    if (ds?.elements?.x300600c6) {
+                        const arr = parseVal(ds.string?.('x300600c6'));
+                        if (arr) return arr;
+                        const raw = ds.elements.x300600c6.value;
+                        const arr2 = parseVal(raw);
+                        if (arr2) return arr2;
+                    }
+                    const arr = parseVal(ds?.string?.('x0070030c'));
+                    if (arr) return arr;
+                }
+            }
+        }
+    } catch (e) { /* ignore */ }
+
+    // 3) Fallback: scan all elements for (3006,00C6)
+    try {
+        for (const elem of dataSet.iterall()) {
+            if (elem.tag && elem.tag.toString() === '3006,00C6') {
+                const arr = parseVal(elem.value);
+                if (arr) return arr;
+            }
+        }
+    } catch (e) { /* ignore */ }
+
+    return null;
+}
+
+function parseMatrixString(val) {
+    if (!val) return null;
+    let arr = null;
+    if (Array.isArray(val)) {
+        arr = val.map(v => parseFloat(v)).filter(Number.isFinite);
+    } else if (typeof val === 'string') {
+        arr = val.split('\\').map(v => parseFloat(v)).filter(Number.isFinite);
+    }
+    if (arr && arr.length === 16) return arr;
+    return null;
+}
+
+function sortSlicesByPosition(list) {
+    if (!Array.isArray(list)) return [];
+    const sorted = [...list];
+    let normal = [0, 0, 1];
+    try {
+        const firstOri = list[0]?.dataSet?.string?.(Tag.ImageOrientationPatient);
+        if (firstOri) {
+            const vals = firstOri.split('\\').map(parseFloat);
+            if (vals.length === 6) {
+                const rowCos = normalizeVec3(vals.slice(0, 3));
+                const colCos = normalizeVec3(vals.slice(3, 6));
+                normal = normalizeVec3(cross3(rowCos, colCos));
+            }
+        }
+    } catch (e) { /* ignore */ }
+    sorted.sort((a, b) => {
+        const posA = parseImagePosition(a?.dataSet);
+        const posB = parseImagePosition(b?.dataSet);
+        const projA = dot3(posA, normal);
+        const projB = dot3(posB, normal);
+        return projA - projB;
+    });
+    return sorted;
+}
+
+function parseImagePosition(ds) {
+    try {
+        const pos = (ds?.string?.(Tag.ImagePositionPatient) || '0\\0\\0').split('\\').map(parseFloat);
+        if (pos.length === 3 && pos.every(Number.isFinite)) return pos;
+    } catch (e) { /* ignore */ }
+    return [0, 0, 0];
+}
+
+function buildVolumeFromSlices(slices, modalityLabel = 'MR') {
+    if (!slices || !slices.length) return null;
+    const sorted = sortSlicesByPosition(slices);
+    const first = sorted[0].dataSet;
+    const width = first.uint16(Tag.Columns) || 512;
+    const height = first.uint16(Tag.Rows) || 512;
+    const pixelSpacing = (first.string(Tag.PixelSpacing) || '1\\1').split('\\').map(parseFloat);
+    const rowSpacing = pixelSpacing[0] || 1;
+    const colSpacing = pixelSpacing[1] || 1;
+    const orientation = (first.string(Tag.ImageOrientationPatient) || '1\\0\\0\\0\\1\\0').split('\\').map(parseFloat);
+    const rowCos = normalizeVec3(orientation.slice(0, 3));
+    const colCos = normalizeVec3(orientation.slice(3, 6));
+    const normal = normalizeVec3(cross3(rowCos, colCos));
+    const positions = sorted.map(s => parseImagePosition(s.dataSet));
+    const sliceSpacing = computeSliceSpacing(positions, normal, first.floatString('x00180050') || 1.0);
+    const slope = first.floatString(Tag.RescaleSlope) || 1;
+    const intercept = first.floatString(Tag.RescaleIntercept) || 0;
+
+    const scalars = new Float32Array(width * height * sorted.length);
+    let offset = 0;
+    sorted.forEach(slice => {
+        const ds = slice.dataSet;
+        const pixelDataElement = ds.elements?.x7fe00010;
+        if (!pixelDataElement) { offset += width * height; return; }
+        const raw = new Int16Array(slice.byteArray.buffer, pixelDataElement.dataOffset, pixelDataElement.length / 2);
+        const len = Math.min(raw.length, width * height);
+        for (let i = 0; i < len; i++) {
+            scalars[offset + i] = raw[i] * slope + intercept;
+        }
+        offset += width * height;
+    });
+
+    return {
+        slices: sorted,
+        width,
+        height,
+        depth: sorted.length,
+        rowSpacing,
+        colSpacing,
+        sliceSpacing,
+        rowCos,
+        colCos,
+        normal,
+        origin: positions[0],
+        positions,
+        slope,
+        intercept,
+        scalars,
+        modality: modalityLabel
+    };
+}
+
+function computeSliceSpacing(positions, normal, fallback = 1.0) {
+    if (!positions || positions.length < 2) return fallback || 1.0;
+    const deltas = [];
+    for (let i = 1; i < positions.length; i++) {
+        const prev = positions[i - 1];
+        const curr = positions[i];
+        const diff = [curr[0] - prev[0], curr[1] - prev[1], curr[2] - prev[2]];
+        const dist = Math.abs(dot3(diff, normal));
+        if (Number.isFinite(dist) && dist > 0) deltas.push(dist);
+    }
+    if (!deltas.length) return fallback || 1.0;
+    return deltas.reduce((a, b) => a + b, 0) / deltas.length;
+}
+
+function computeVolumeStats(volume, percentile = 95) {
+    if (!volume || !volume.scalars) return null;
+    const data = volume.scalars;
+    let min = Infinity, max = -Infinity;
+    const sample = [];
+    const step = Math.max(1, Math.floor(data.length / 200000));
+    for (let i = 0; i < data.length; i += step) {
+        const v = data[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
+        sample.push(v);
+    }
+    sample.sort((a, b) => a - b);
+    const pctVal = (p) => {
+        if (!sample.length) return 0;
+        const idx = Math.min(sample.length - 1, Math.max(0, Math.round(p * (sample.length - 1))));
+        return sample[idx];
+    };
+    const p95 = pctVal(0.95);
+    const p99 = pctVal(0.99);
+    const pCustom = pctVal(Math.min(0.999, Math.max(0, percentile / 100)));
+    const stats = { min, max, p95, p99, pCustom, percentileUsed: percentile };
+    volume.stats = stats;
+    return stats;
+}
+
+function normalizeMrValue(val, stats, targetHU, percentile, useNormalization = true) {
+    if (!useNormalization || !stats) return val;
+    const ref = (stats.percentileUsed === percentile && Number.isFinite(stats.pCustom)) ? stats.pCustom
+        : (percentile >= 99 ? stats.p99 : stats.p95);
+    const span = (ref - stats.min);
+    if (!Number.isFinite(span) || span === 0) return val;
+    const scaled = ((val - stats.min) / span) * targetHU;
+    return Math.max(-1024, Math.min(1500, scaled));
+}
+
+function buildCtGeometry() {
+    if (!ctFiles || !ctFiles.length) return null;
+    const slices = sortSlicesByPosition(ctFiles);
+    const first = slices[0].dataSet;
+    const width = first.uint16(Tag.Columns) || 512;
+    const height = first.uint16(Tag.Rows) || 512;
+    const pixelSpacing = (first.string(Tag.PixelSpacing) || '1\\1').split('\\').map(parseFloat);
+    const rowSpacing = pixelSpacing[0] || 1;
+    const colSpacing = pixelSpacing[1] || 1;
+    const orientation = (first.string(Tag.ImageOrientationPatient) || '1\\0\\0\\0\\1\\0').split('\\').map(parseFloat);
+    const rowCos = normalizeVec3(orientation.slice(0, 3));
+    const colCos = normalizeVec3(orientation.slice(3, 6));
+    const normal = normalizeVec3(cross3(rowCos, colCos));
+    const positions = slices.map(s => parseImagePosition(s.dataSet));
+    const sliceSpacing = computeSliceSpacing(positions, normal, first.floatString('x00180050') || 1.0);
+    const slope = first.floatString(Tag.RescaleSlope) || 1;
+    const intercept = first.floatString(Tag.RescaleIntercept) || 0;
+    return { slices, width, height, depth: slices.length, rowSpacing, colSpacing, sliceSpacing, rowCos, colCos, normal, positions, slope, intercept };
+}
+
+function worldToVoxel(volume, point) {
+    if (!volume || !point) return null;
+    const origin = volume.origin || [0, 0, 0];
+    const diff = [point[0] - origin[0], point[1] - origin[1], point[2] - origin[2]];
+    // DICOM: row index follows colCos with row spacing; column index follows rowCos with column spacing
+    const i = dot3(diff, volume.colCos) / (volume.rowSpacing || 1);
+    const j = dot3(diff, volume.rowCos) / (volume.colSpacing || 1);
+    const k = dot3(diff, volume.normal) / (volume.sliceSpacing || 1);
+    return { i, j, k };
+}
+
+function sampleVolume(volume, i, j, k, mode = 'linear') {
+    if (!volume || !volume.scalars) return null;
+    const { width, height, depth, scalars } = volume;
+    if (mode === 'nearest') {
+        const ii = Math.round(i), jj = Math.round(j), kk = Math.round(k);
+        if (ii < 0 || jj < 0 || kk < 0 || ii >= height || jj >= width || kk >= depth) return null;
+        const idx = kk * width * height + ii * width + jj;
+        return scalars[idx];
+    }
+
+    const i0 = Math.floor(i), j0 = Math.floor(j), k0 = Math.floor(k);
+    const di = i - i0, dj = j - j0, dk = k - k0;
+    if (i0 < 0 || j0 < 0 || k0 < 0 || i0 + 1 >= height || j0 + 1 >= width || k0 + 1 >= depth) return null;
+
+    const idx = (zz, yy, xx) => zz * width * height + yy * width + xx;
+    const c000 = scalars[idx(k0, i0, j0)];
+    const c001 = scalars[idx(k0, i0, j0 + 1)];
+    const c010 = scalars[idx(k0, i0 + 1, j0)];
+    const c011 = scalars[idx(k0, i0 + 1, j0 + 1)];
+    const c100 = scalars[idx(k0 + 1, i0, j0)];
+    const c101 = scalars[idx(k0 + 1, i0, j0 + 1)];
+    const c110 = scalars[idx(k0 + 1, i0 + 1, j0)];
+    const c111 = scalars[idx(k0 + 1, i0 + 1, j0 + 1)];
+
+    const c00 = c000 * (1 - dj) + c001 * dj;
+    const c01 = c010 * (1 - dj) + c011 * dj;
+    const c10 = c100 * (1 - dj) + c101 * dj;
+    const c11 = c110 * (1 - dj) + c111 * dj;
+    const c0 = c00 * (1 - di) + c01 * di;
+    const c1 = c10 * (1 - di) + c11 * di;
+    return c0 * (1 - dk) + c1 * dk;
+}
+
+function getMRControlsConfig() {
+    const normToggle = document.getElementById('mrUseNormalization');
+    if (normToggle) normToggle.checked = false; // always keep normalization off for raw MR scale
+    const useNormalization = false;
+    const targetHU = parseFloat(document.getElementById('mrTargetHU')?.value) || 600;
+    const percentile = Math.max(50, Math.min(100, parseFloat(document.getElementById('mrNormPercentile')?.value) || 95));
+    const interpolation = document.getElementById('mrInterpolation')?.value || 'linear';
+    const matrixDir = document.querySelector('input[name="mrMatrixDir"]:checked')?.value || 'mrct';
+    const outputNameInput = (document.getElementById('mrOutputName')?.value || '').trim();
+    const outputName = outputNameInput || MR_DEFAULT_OUTPUT_NAME;
+    return { useNormalization, targetHU, percentile, interpolation, matrixDir, outputName };
+}
+
+async function resampleMRToCT() {
+    if (!ctFiles || !ctFiles.length) {
+        showMessage('error', 'Load CT before MR padding.');
+        updateMrStatusText('Load CT before MR padding.');
+        return null;
+    }
+    if (!mrSeries || !mrSeries.length) {
+        showMessage('error', 'Load MR series for padding.');
+        updateMrStatusText('Load MR series.');
+        return null;
+    }
+    // Choose registration and direction to map MR -> CT
+    const ctFor = currentCTSeries?.forUID;
+    const mrFor = currentMRSeries?.forUID;
+    const composeFromTransforms = (reg) => {
+        if (!reg || !reg.transforms || !ctFor || !mrFor) return null;
+        const ctXform = reg.transforms.find(t => t.forUID === ctFor);
+        const mrXform = reg.transforms.find(t => t.forUID === mrFor);
+        if (!ctXform || !ctXform.matrix || !mrXform || !mrXform.matrix) return null;
+        const invCt = invertMatrix4(ctXform.matrix);
+        if (!invCt) return null;
+        return multiplyMatrix4(invCt, mrXform.matrix); // MR->CT = inv(CT->reg) * (MR->reg)
+    };
+    const chooseRegistration = () => {
+        const candidates = mrRegistrations || [];
+        for (const reg of candidates) {
+            const hasTransforms = reg.transforms && reg.transforms.length >= 2;
+            if ((!reg.matrix && !hasTransforms) || !reg.forList || reg.forList.length < 2) continue;
+            const fromFOR = reg.forList[0];
+            const toFOR = reg.forList[1];
+            if (fromFOR === mrFor && toFOR === ctFor) {
+                const composed = composeFromTransforms(reg);
+                return { reg, matrix: composed || reg.matrix, inverted: false };
+            }
+            if (fromFOR === ctFor && toFOR === mrFor) {
+                const inv = invertMatrix4(reg.matrix);
+                const composed = composeFromTransforms(reg);
+                if (composed) return { reg, matrix: composed, inverted: false };
+                if (inv) return { reg, matrix: inv, inverted: true };
+            }
+            const composed = composeFromTransforms(reg);
+            if (composed) return { reg, matrix: composed, inverted: false };
+        }
+        // fallback: first with usable data
+        const any = candidates.find(r => r.matrix || (r.transforms && r.transforms.length >= 2));
+        if (any) {
+            const composed = composeFromTransforms(any);
+            return { reg: any, matrix: composed || any.matrix, inverted: false };
+        }
+        return null;
+    };
+    const sel = chooseRegistration();
+    if (sel) {
+        mrRegistration = sel.reg;
+        mrToCtMatrix = sel.matrix;
+    } else if (mrRegistration) {
+        mrToCtMatrix = mrToCtMatrix || composeFromTransforms(mrRegistration) || mrRegistration.matrix;
+    }
+
+    if (!mrToCtMatrix) {
+        showMessage('error', 'Load registration DICOM before resampling.');
+        updateMrStatusText('Registration missing.');
+        return null;
+    }
+    const regFor = mrRegistration?.forList || [];
+    if (regFor.length && (ctFor || mrFor) && (!(ctFor && regFor.includes(ctFor)) || !(mrFor && regFor.includes(mrFor)))) {
+        showMessage('info', 'REG FORs do not match CT/MR FORs; proceeding with provided matrix.');
+    }
+
+    const config = getMRControlsConfig();
+    const ctGeom = buildCtGeometry();
+    if (!ctGeom) {
+        showMessage('error', 'Unable to parse CT geometry.');
+        updateMrStatusText('CT geometry unavailable.');
+        return null;
+    }
+    mrVolume = mrVolume || buildVolumeFromSlices(mrSeries, 'MR');
+    if (!mrVolume) {
+        showMessage('error', 'Unable to build MR volume.');
+        updateMrStatusText('MR volume unavailable.');
+        return null;
+    }
+    if (config.useNormalization && (!mrStats || mrStats.percentileUsed !== config.percentile)) {
+        mrStats = computeVolumeStats(mrVolume, config.percentile);
+    }
+
+    const mrRange = mrDefaultWindowRange || mrWindowRange || { min: -Infinity, max: Infinity };
+    const mrMin = Number.isFinite(mrRange.min) ? mrRange.min : -Infinity;
+    const mrMax = Number.isFinite(mrRange.max) ? mrRange.max : Infinity;
+    const ctMin = ctWindowRange?.min ?? -200;
+    const ctMax = ctWindowRange?.max ?? 800;
+    const ctSpan = Math.max(1e-3, ctMax - ctMin);
+    const mrSpan = Math.max(1e-3, mrMax - mrMin);
+
+    const regMatrix = mrToCtMatrix || composeFromTransforms(mrRegistration) || mrRegistration.matrix;
+    const mrToCt = (config.matrixDir === 'mrct') ? regMatrix : invertMatrix4(regMatrix);
+    const ctToMr = invertMatrix4(mrToCt);
+    if (!ctToMr) {
+        showMessage('error', 'Registration matrix is not invertible.');
+        updateMrStatusText('Registration matrix invalid.');
+        return null;
+    }
+
+    const { width, height, depth, rowSpacing, colSpacing, sliceSpacing, rowCos, colCos, normal, positions, slope, intercept } = ctGeom;
+    // DICOM coordinate mapping: rows follow colCos * rowSpacing; columns follow rowCos * colSpacing
+    const rowVec = colCos.map(v => v * rowSpacing);
+    const colVec = rowCos.map(v => v * colSpacing);
+    const normVec = normal.map(v => v * sliceSpacing);
+    void normVec; // kept for parity; normVec not used directly but retained for clarity
+
+    updateMrStatusText('Resampling MR into CT grid...');
+    updateMRProgress(0, '');
+
+    const resampled = [];
+    for (let sliceIdx = 0; sliceIdx < depth; sliceIdx++) {
+        const ctSlice = ctGeom.slices[sliceIdx];
+        const pos = positions[sliceIdx] || positions[0];
+        const pixelDataElement = ctSlice?.dataSet?.elements?.x7fe00010;
+        if (!pixelDataElement) continue;
+        let basePixels = null;
+        try {
+            basePixels = new Int16Array(ctSlice.byteArray.buffer, pixelDataElement.dataOffset, pixelDataElement.length / 2);
+        } catch (e) {
+            basePixels = null;
+        }
+        if (!basePixels) continue;
+
+        const outHU = new Float32Array(basePixels.length);
+        for (let i = 0; i < basePixels.length; i++) {
+            outHU[i] = basePixels[i] * slope + intercept;
+        }
+
+        // Build base for each row to reduce repeated math
+        for (let r = 0; r < height; r++) {
+            const rowBaseWorld = [
+                pos[0] + rowVec[0] * r,
+                pos[1] + rowVec[1] * r,
+                pos[2] + rowVec[2] * r
+            ];
+            for (let c = 0; c < width; c++) {
+                const world = [
+                    rowBaseWorld[0] + colVec[0] * c,
+                    rowBaseWorld[1] + colVec[1] * c,
+                    rowBaseWorld[2] + colVec[2] * c
+                ];
+                const mrWorld = applyMatrix4(ctToMr, world);
+                const vox = worldToVoxel(mrVolume, mrWorld);
+                if (!vox) continue;
+                const val = sampleVolume(mrVolume, vox.i, vox.j, vox.k, config.interpolation || 'linear');
+                if (val === null || val === undefined) continue;
+                const clamped = Math.max(mrMin, Math.min(mrMax, val));
+                const normVal = ctMin + ((clamped - mrMin) / mrSpan) * ctSpan;
+                const idx = r * width + c;
+                outHU[idx] = normVal;
+            }
+        }
+
+        // Stamp warnings and provenance directly into the MR-padded preview/export
+        const annotationLines = ['NOT FOR DOSE CALCULATION'];
+        const ctName = ctSeriesMap?.[currentCTSeries?.seriesUID || '']?.desc || currentCTSeries?.seriesUID || 'CT';
+        const mrName = mrSeriesMap?.[currentMRSeries?.seriesUID || '']?.desc || currentMRSeries?.seriesUID || 'MR';
+        annotationLines.push(`CT: ${ctName}`);
+        annotationLines.push(`MR: ${mrName}`);
+        annotationLines.forEach((line, idx) => {
+            const margin = FOOTER_MARGIN + idx * (FOOTER_FONT_PX + 4);
+            stampTopLeftWarning(outHU, width, height, line, margin);
+        });
+        // Place clinical warning at bottom
+        stampTopLeftWarning(outHU, width, height, 'NOT FOR CLINICAL USE', null, true);
+
+        const modifiedPixelData = new Int16Array(outHU.length);
+        for (let i = 0; i < outHU.length; i++) {
+            modifiedPixelData[i] = Math.max(-32768, Math.min(32767, Math.round((outHU[i] - intercept) / slope)));
+        }
+        resampled.push({ ...ctSlice, modifiedPixelData, huData: outHU });
+
+        updateMRProgress(((sliceIdx + 1) / depth) * 100, `Slice ${sliceIdx + 1}/${depth}`);
+    }
+
+    updateMrStatusText('MR padding ready.');
+    updateMRProgress(0, '');
+    refreshMrStatusUI();
+    return resampled;
+}
+
+async function buildMRPreview(showToast = true) {
+    const resampled = await resampleMRToCT();
+    if (!resampled || !resampled.length) return false;
+    mrResampledSlices = resampled;
+    mrBlendedSlices = rebuildMrBlend();
+    mrPreviewActive = true;
+    const btn = document.getElementById('mrPreviewBtn');
+    if (btn) btn.textContent = 'Preview Off';
+    window.volumeData = null; // force MPR rebuild with MR data
+    applyWindowForActiveTab();
+    displaySimpleViewer();
+    if (showToast) showMessage('info', 'Preview showing MR-padded CT (MR overrides CT where present).');
+    return true;
+}
+
+async function toggleMRPreview() {
+    if (mrPreviewActive) {
+        mrPreviewActive = false;
+        mrResampledSlices = [];
+        mrBlendedSlices = [];
+        const btn = document.getElementById('mrPreviewBtn');
+        if (btn) btn.textContent = 'Preview MR→CT';
+        window.volumeData = null;
+        applyWindowForActiveTab();
+        displaySimpleViewer();
+        updateMrStatusText('Preview off.');
+        return;
+    }
+    await buildMRPreview(true);
+}
+
+async function exportMRPadded() {
+    // Always export full MR (100%) regardless of blend slider
+    const resampled = await resampleMRToCT();
+    if (!resampled || !resampled.length) return;
+    mrResampledSlices = resampled;
+    mrBlendedSlices = [];
+    const config = getMRControlsConfig();
+    const seriesDesc = `${config.outputName} | MRPad v${VERSION_DEFAULT}`;
+    const folderNameOverride = `${config.outputName}`.replace(/\s+/g, '_');
+    const ctSeriesName = currentCTSeries?.seriesUID || 'CT';
+    const mrSeriesName = currentMRSeries?.seriesUID || 'MR';
+    updateMrStatusText('Exporting MR-padded CT...');
+    await exportModifiedDICOM(resampled, {
+        seriesDescriptionOverride: seriesDesc,
+        folderNameOverride,
+        zipNameSuffix: 'MRPad',
+        derivationText: 'MR padded into CT pixels (rigid registration)',
+        mrContext: { ctSeriesName, mrSeriesName }
+    });
+    showMessage('success', 'Exported MR-padded CT series.');
+    updateMrStatusText('Export complete.');
+}
+
+// Vector / matrix helpers
+function dot3(a, b) { return (a[0] * b[0]) + (a[1] * b[1]) + (a[2] * b[2]); }
+function cross3(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+function normalizeVec3(v) {
+    const mag = Math.sqrt(dot3(v, v)) || 1;
+    return [v[0] / mag, v[1] / mag, v[2] / mag];
+}
+function applyMatrix4(mat, point) {
+    if (!mat || mat.length !== 16) return point;
+    const [x, y, z] = point;
+    return [
+        mat[0] * x + mat[1] * y + mat[2] * z + mat[3],
+        mat[4] * x + mat[5] * y + mat[6] * z + mat[7],
+        mat[8] * x + mat[9] * y + mat[10] * z + mat[11]
+    ];
+}
+function multiplyMatrix4(a, b) {
+    if (!a || !b || a.length !== 16 || b.length !== 16) return null;
+    const out = new Array(16).fill(0);
+    for (let row = 0; row < 4; row++) {
+        for (let col = 0; col < 4; col++) {
+            const idx = row * 4 + col;
+            out[idx] =
+                a[row * 4 + 0] * b[0 * 4 + col] +
+                a[row * 4 + 1] * b[1 * 4 + col] +
+                a[row * 4 + 2] * b[2 * 4 + col] +
+                a[row * 4 + 3] * b[3 * 4 + col];
+        }
+    }
+    return out;
+}
+function invertMatrix4(m) {
+    if (!m || m.length !== 16) return null;
+    const inv = [];
+    inv[0] = m[5]  * m[10] * m[15] - 
+             m[5]  * m[11] * m[14] - 
+             m[9]  * m[6]  * m[15] + 
+             m[9]  * m[7]  * m[14] +
+             m[13] * m[6]  * m[11] - 
+             m[13] * m[7]  * m[10];
+    inv[4] = -m[4]  * m[10] * m[15] + 
+              m[4]  * m[11] * m[14] + 
+              m[8]  * m[6]  * m[15] - 
+              m[8]  * m[7]  * m[14] - 
+              m[12] * m[6]  * m[11] + 
+              m[12] * m[7]  * m[10];
+    inv[8] = m[4]  * m[9] * m[15] - 
+             m[4]  * m[11] * m[13] - 
+             m[8]  * m[5] * m[15] + 
+             m[8]  * m[7] * m[13] + 
+             m[12] * m[5] * m[11] - 
+             m[12] * m[7] * m[9];
+    inv[12] = -m[4]  * m[9] * m[14] + 
+               m[4]  * m[10] * m[13] +
+               m[8]  * m[5] * m[14] - 
+               m[8]  * m[6] * m[13] - 
+               m[12] * m[5] * m[10] + 
+               m[12] * m[6] * m[9];
+    inv[1] = -m[1]  * m[10] * m[15] + 
+              m[1]  * m[11] * m[14] + 
+              m[9]  * m[2] * m[15] - 
+              m[9]  * m[3] * m[14] - 
+              m[13] * m[2] * m[11] + 
+              m[13] * m[3] * m[10];
+    inv[5] = m[0]  * m[10] * m[15] - 
+             m[0]  * m[11] * m[14] - 
+             m[8]  * m[2] * m[15] + 
+             m[8]  * m[3] * m[14] + 
+             m[12] * m[2] * m[11] - 
+             m[12] * m[3] * m[10];
+    inv[9] = -m[0]  * m[9] * m[15] + 
+              m[0]  * m[11] * m[13] + 
+              m[8]  * m[1] * m[15] - 
+              m[8]  * m[3] * m[13] - 
+              m[12] * m[1] * m[11] + 
+              m[12] * m[3] * m[9];
+    inv[13] = m[0]  * m[9] * m[14] - 
+              m[0]  * m[10] * m[13] - 
+              m[8]  * m[1] * m[14] + 
+              m[8]  * m[2] * m[13] + 
+              m[12] * m[1] * m[10] - 
+              m[12] * m[2] * m[9];
+    inv[2] = m[1]  * m[6] * m[15] - 
+             m[1]  * m[7] * m[14] - 
+             m[5]  * m[2] * m[15] + 
+             m[5]  * m[3] * m[14] + 
+             m[13] * m[2] * m[7] - 
+             m[13] * m[3] * m[6];
+    inv[6] = -m[0]  * m[6] * m[15] + 
+              m[0]  * m[7] * m[14] + 
+              m[4]  * m[2] * m[15] - 
+              m[4]  * m[3] * m[14] - 
+              m[12] * m[2] * m[7] + 
+              m[12] * m[3] * m[6];
+    inv[10] = m[0]  * m[5] * m[15] - 
+              m[0]  * m[7] * m[13] - 
+              m[4]  * m[1] * m[15] + 
+              m[4]  * m[3] * m[13] + 
+              m[8]  * m[1] * m[7] - 
+              m[8]  * m[3] * m[5];
+    inv[14] = -m[0]  * m[5] * m[14] + 
+               m[0]  * m[6] * m[13] + 
+               m[4]  * m[1] * m[14] - 
+               m[4]  * m[2] * m[13] - 
+               m[8]  * m[1] * m[6] + 
+               m[8]  * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + 
+              m[1] * m[7] * m[10] + 
+              m[5] * m[2] * m[11] - 
+              m[5] * m[3] * m[10] - 
+              m[9] * m[2] * m[7] + 
+              m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - 
+             m[0] * m[7] * m[10] - 
+             m[4] * m[2] * m[11] + 
+             m[4] * m[3] * m[10] + 
+             m[8] * m[2] * m[7] - 
+             m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + 
+               m[0] * m[7] * m[9] + 
+               m[4] * m[1] * m[11] - 
+               m[4] * m[3] * m[9] - 
+               m[8] * m[1] * m[7] + 
+               m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - 
+              m[0] * m[6] * m[9] - 
+              m[4] * m[1] * m[10] + 
+              m[4] * m[2] * m[9] + 
+              m[8] * m[1] * m[6] - 
+              m[8] * m[2] * m[5];
+
+    let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (det === 0 || !Number.isFinite(det)) return null;
+    det = 1.0 / det;
+    for (let i = 0; i < 16; i++) inv[i] = inv[i] * det;
+    return inv;
 }
 
 function extractROIData() {
@@ -1177,6 +2479,7 @@ function updateROIOverlay() {
 
 // Draw ROI overlay on sagittal view
 function drawROIOverlaySagittal(ctx, volume, sliceX, displayParams) {
+    if (activeTab === 'mr') return;
     if (!RTSSMarks || RTSSMarks.length === 0) return;
     if (!roiData || roiData.length === 0) return;
     if (!displayParams) return;
@@ -1232,6 +2535,7 @@ function drawROIOverlaySagittal(ctx, volume, sliceX, displayParams) {
 
 // Draw ROI overlay on coronal view
 function drawROIOverlayCoronal(ctx, volume, sliceY, displayParams) {
+    if (activeTab === 'mr') return;
     if (!RTSSMarks || RTSSMarks.length === 0) return;
     if (!roiData || roiData.length === 0) return;
     if (!displayParams) return;
@@ -1287,6 +2591,7 @@ function drawROIOverlayCoronal(ctx, volume, sliceY, displayParams) {
 
 // Draw ROI overlays on canvas
 function drawROIOverlayOnCanvas(ctx, ctData, sliceIndex, width, height, displayParams) {
+    if (activeTab === 'mr') return;
     if (!RTSSMarks || RTSSMarks.length === 0) return;
     if (!roiData || roiData.length === 0) return;
     if (window.previewMode && previewIsRealBurn) return;
@@ -1983,8 +3288,8 @@ function stampFooterAnnotation(huData, width, height, roiEntries, delta = FOOTER
     }
 }
 
-// Hard-burn a warning label at the top-left corner on every slice
-function stampTopLeftWarning(huData, width, height, text = 'NOT VALIDATED FOR CLINICAL USE') {
+// Hard-burn a warning label at the top-left corner on every slice (or bottom if requested)
+function stampTopLeftWarning(huData, width, height, text = 'NOT VALIDATED FOR CLINICAL USE', topOffset = null, placeBottom = false) {
     if (!text || !text.trim()) return;
 
     // Prepare a measuring canvas to size the final draw
@@ -2013,9 +3318,11 @@ function stampTopLeftWarning(huData, width, height, text = 'NOT VALIDATED FOR CL
     const img = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
     const data = img.data;
     const clampHU = (val) => Math.max(-1024, Math.min(12000, val));
-    // Stamp at top-left origin (0,0)
+    const startRow = placeBottom
+        ? Math.max(0, height - canvasHeight - margin)
+        : ((topOffset !== null && Number.isFinite(topOffset)) ? topOffset : 0);
     for (let y = 0; y < canvasHeight; y++) {
-        const py = y;
+        const py = startRow + y;
         if (py < 0 || py >= height) continue;
         const rowBase = py * width;
         for (let x = 0; x < canvasWidth; x++) {
@@ -2167,8 +3474,25 @@ function burnSlices(sourceSlices, burnInSettings, options = {}) {
             stampFooterAnnotation(huData, width, height, footerEntries, footerDelta, noteText);
         }
 
-        // Always stamp a clinical-use warning at the top-left of each slice
-        stampTopLeftWarning(huData, width, height, 'NOT VALIDATED FOR CLINICAL USE');
+        // Always stamp warnings and provenance on MR padded output
+        if (options?.mrContext) {
+            const { ctSeriesName, mrSeriesName } = options.mrContext;
+            stampTopLeftWarning(huData, width, height, 'NOT FOR DOSE CALCULATION');
+            if (ctSeriesName || mrSeriesName) {
+                const lines = [
+                    ctSeriesName ? `CT: ${ctSeriesName}` : '',
+                    mrSeriesName ? `MR: ${mrSeriesName}` : ''
+                ].filter(Boolean);
+                lines.forEach((line, idx) => {
+                    const margin = FOOTER_MARGIN + idx * (FOOTER_FONT_PX + 4);
+                    stampTopLeftWarning(huData, width, height, line, margin);
+                });
+            }
+            stampTopLeftWarning(huData, width, height, 'NOT FOR CLINICAL USE', null, true);
+        } else {
+            // Legacy warning for RT burn flows
+            stampTopLeftWarning(huData, width, height, 'NOT VALIDATED FOR CLINICAL USE');
+        }
 
         // TODO: textEnabled support for future enhancement
         if (textEnabled && sliceIdx % Math.max(1, textInterval) === 0) {
@@ -2515,12 +3839,12 @@ function buildSeriesDescriptionForExport() {
     return `${baseName}${suffix}`;
 }
 // Export modified DICOM files
-async function exportModifiedDICOM(processedCTs) {
+async function exportModifiedDICOM(processedCTs, options = {}) {
     updateStatus('Exporting modified DICOM files...');
 
     // Use Image Set Name (or default) as base; append burned structure names for SeriesDescription only
     const inputName = (document.getElementById('imageSetName')?.value || '').trim();
-    const baseName = inputName || getDefaultSeriesName();
+    const baseName = options.seriesDescriptionOverride ? options.seriesDescriptionOverride.split('|')[0].trim() : (inputName || getDefaultSeriesName());
     let burnedNames = [];
     if (Array.isArray(window.tempExportPairs) && window.tempExportPairs.length) {
         // tempExportPairs like ["ITV_1000HU", ...] → extract names before first underscore
@@ -2528,12 +3852,12 @@ async function exportModifiedDICOM(processedCTs) {
     } else if (Array.isArray(roiData) && roiData.length) {
         burnedNames = roiData.filter(r => r.selected).map(r => r.name);
     }
-    const seriesDescription = burnedNames.length ? `${baseName} | ${burnedNames.join(' | ')}` : baseName;
+    const seriesDescription = options.seriesDescriptionOverride || (burnedNames.length ? `${baseName} | ${burnedNames.join(' | ')}` : baseName);
     // Keep folder grouping readable: base name only
-    const folderName = `${baseName}`.replace(/\s+/g, '_');
+    const folderName = (options.folderNameOverride || `${baseName}`).replace(/\s+/g, '_');
     // Zip filename should contain burned ROI name(s)
     const sanitize = (s) => String(s).trim().replace(/[^A-Za-z0-9._-]+/g, '_');
-    const roiPart = burnedNames.length ? burnedNames.map(sanitize).join('_') : 'NoROI';
+    const roiPart = options.zipNameSuffix ? sanitize(options.zipNameSuffix) : (burnedNames.length ? burnedNames.map(sanitize).join('_') : 'NoROI');
     const zipFilename = `${sanitize(baseName)}__${roiPart}.zip`;
 
     // Prepare ZIP
@@ -2612,11 +3936,11 @@ async function exportModifiedDICOM(processedCTs) {
 
         // Optional: DerivationDescription (0008,2111) ST → append "Burned: <ROI1 | ROI2>" (if exists)
         const eDeriv = dataSet.elements.x00082111;
-        if (eDeriv && Array.isArray(burnedNames) && burnedNames.length) {
+        if (eDeriv) {
             let existing = '';
             try { existing = dataSet.string('x00082111') || ''; } catch (ex) { existing = ''; }
-            const appendText = `Burned: ${burnedNames.join(' | ')}`;
-            const finalText = existing ? `${existing} | ${appendText}` : appendText;
+            const appendText = options.derivationText || (Array.isArray(burnedNames) && burnedNames.length ? `Burned: ${burnedNames.join(' | ')}` : '');
+            const finalText = appendText ? (existing ? `${existing} | ${appendText}` : appendText) : existing;
             writeASCIIInto(newByteArray, eDeriv.dataOffset, eDeriv.length, finalText, false);
         }
 
@@ -2874,12 +4198,15 @@ async function initializeSimpleViewer() {
     window.simpleViewerData = {
         currentSlice: Math.floor((seriesInit.length || 1) / 2),
         isShowingBurned: false,
-        windowWidth: 400,
-        windowLevel: 40
+        windowWidth: Math.max(1, (ctWindowRange.max || 0) - (ctWindowRange.min || 0)),
+        windowLevel: ((ctWindowRange.max || 0) + (ctWindowRange.min || 0)) / 2
     };
     
     // Setup mouse interactions for viewports
     setupViewportInteractions();
+    
+    syncWindowInputsToActiveTab();
+    applyWindowForActiveTab();
     
     // Display initial slice
     setTimeout(() => {
@@ -2901,6 +4228,11 @@ async function initializeSimpleViewer() {
 }
 
 function getActiveSeries() {
+    if (activeTab === 'mr') {
+        if (mrPreviewActive && Array.isArray(mrBlendedSlices) && mrBlendedSlices.length) return mrBlendedSlices;
+        if (mrPreviewActive && Array.isArray(mrResampledSlices) && mrResampledSlices.length) return mrResampledSlices;
+        return Array.isArray(ctFiles) ? ctFiles : [];
+    }
     const usePreview = (window.previewMode && previewIsRealBurn && Array.isArray(previewBurnedCTData) && previewBurnedCTData.length);
     if (usePreview) return previewBurnedCTData;
     if (window.simpleViewerData && window.simpleViewerData.isShowingBurned && Array.isArray(processedCTData) && processedCTData.length) return processedCTData;
@@ -3168,25 +4500,16 @@ function navigateSlice(delta) {
 
 // Adjust window width and level
 function adjustWindowLevel(deltaX, deltaY) {
-    if (!window.simpleViewerData) return;
-    
-    // Adjust window width with horizontal movement
-    window.simpleViewerData.windowWidth = Math.max(1, 
-        window.simpleViewerData.windowWidth + deltaX * 2);
-    
-    // Adjust window level with vertical movement
-    window.simpleViewerData.windowLevel = 
-        window.simpleViewerData.windowLevel - deltaY * 2;
-    
-    // Update display
+    // Right-drag WL should always adjust CT windowing (even on MR tab)
+    const range = ctWindowRange || { min: -160, max: 240 };
+    let ww = Math.max(1, (range.max - range.min) + deltaX * 2);
+    let wl = ((range.max + range.min) / 2) - deltaY * 2;
+    const min = wl - ww / 2;
+    const max = wl + ww / 2;
+    ctWindowRange = { min, max };
+    updateWindowRangeLabels();
+    applyWindowForActiveTab();
     displaySimpleViewer();
-    
-    // Update UI controls if they exist
-    const windowWidthInput = document.getElementById('windowWidth');
-    const windowLevelInput = document.getElementById('windowLevel');
-    
-    if (windowWidthInput) windowWidthInput.value = Math.round(window.simpleViewerData.windowWidth);
-    if (windowLevelInput) windowLevelInput.value = Math.round(window.simpleViewerData.windowLevel);
 }
 
 function displaySimpleViewer() {
@@ -3426,9 +4749,7 @@ function displaySimpleViewer() {
 
 // Create volume data for MPR reconstruction
 async function createVolumeData() {
-    const usePreview = (window.previewMode && previewIsRealBurn && previewBurnedCTData && previewBurnedCTData.length);
-    const useProcessed = (!usePreview && window.simpleViewerData && window.simpleViewerData.isShowingBurned && processedCTData && processedCTData.length);
-    const series = usePreview ? previewBurnedCTData : (useProcessed ? processedCTData : ctFiles);
+    const series = getActiveSeries();
     if (!series || series.length === 0) return null;
     
     const volume = {
@@ -3580,11 +4901,11 @@ function renderSagittalView(volume, sliceX) {
     ctx.save();
     
     // Calculate aspect ratio
-    const pixelSpacingY = volume.pixelSpacing ? volume.pixelSpacing[1] : 1.0;
     const sliceSpacing = volume.sliceSpacing || 1.0;
+    const rowSpacing = volume.pixelSpacing ? volume.pixelSpacing[0] : 1.0;
     
     // Calculate the display scale to fit the viewport
-    const dataAspectRatio = (height * sliceSpacing) / (width * pixelSpacingY);
+    const dataAspectRatio = (height * sliceSpacing) / (width * rowSpacing);
     const viewportAspectRatio = canvas.height / canvas.width;
     
     let displayWidth, displayHeight;
@@ -3708,7 +5029,7 @@ function renderCoronalView(volume, sliceY) {
     ctx.save();
     
     // Calculate aspect ratio
-    const pixelSpacingX = volume.pixelSpacing ? volume.pixelSpacing[0] : 1.0;
+    const pixelSpacingX = volume.pixelSpacing ? volume.pixelSpacing[1] : 1.0;
     const sliceSpacing = volume.sliceSpacing || 1.0;
     
     // Calculate the display scale to fit the viewport
@@ -3884,11 +5205,8 @@ function setWindowPreset(preset) {
     const target = presets[preset];
     if (!target) return;
 
-    // Update inputs that actually exist in the sidebar
-    const wwInput = document.getElementById('windowWidth');
-    const wlInput = document.getElementById('windowLevel');
-    if (wwInput) wwInput.value = target.window;
-    if (wlInput) wlInput.value = target.level;
+    const targetModality = (activeTab === 'mr' && mrPreviewActive) ? 'MR' : 'CT';
+    setWindowRangeFromWWL(target.window, target.level, targetModality);
 
     if (dicomViewer && dicomViewer.setWindowPreset) {
         dicomViewer.setWindowPreset(preset);
@@ -3904,22 +5222,276 @@ function setWindowPreset(preset) {
         presetButtons.forEach(btn => btn.classList.remove('active'));
         // No reliable event target here; callers should manage active state
     }
+    applyWindowForActiveTab();
 }
 
 function updateWindowLevel() {
+    // Legacy hook; inputs removed. Kept for safety if called programmatically.
+    const targetModality = (activeTab === 'mr' && mrPreviewActive) ? 'MR' : 'CT';
+    const range = targetModality === 'MR' ? mrWindowRange : ctWindowRange;
+    const ww = Math.max(1, (range.max || 0) - (range.min || 0));
+    const wl = ((range.max || 0) + (range.min || 0)) / 2;
+    setWindowRangeFromWWL(ww, wl, targetModality);
+    applyWindowForActiveTab();
+    displaySimpleViewer();
+}
+
+function getDisplayWindowRange() {
+    // Display windowing follows CT range only; MR uses its own clamp internally
+    return ctWindowRange;
+}
+
+function syncWindowInputsToActiveTab() {
     const wwInput = document.getElementById('windowWidth');
     const wlInput = document.getElementById('windowLevel');
-    const windowValue = wwInput ? parseInt(wwInput.value) : window.simpleViewerData.windowWidth;
-    const levelValue = wlInput ? parseInt(wlInput.value) : window.simpleViewerData.windowLevel;
+    const range = getDisplayWindowRange();
+    const ww = Math.max(1, (range.max || 0) - (range.min || 0));
+    const wl = ((range.max || 0) + (range.min || 0)) / 2;
+    if (wwInput) wwInput.value = Math.round(ww);
+    if (wlInput) wlInput.value = Math.round(wl);
+    updateWindowRangeLabels();
+}
 
-    if (dicomViewer && dicomViewer.applyWindowLevel) {
-        dicomViewer.currentWindow = { window: windowValue, level: levelValue };
-        dicomViewer.applyWindowLevel();
-    } else if (window.simpleViewerData) {
-        window.simpleViewerData.windowWidth = windowValue;
-        window.simpleViewerData.windowLevel = levelValue;
+function applyWindowForActiveTab() {
+    const range = getDisplayWindowRange();
+    const ww = Math.max(1, (range.max || 0) - (range.min || 0));
+    const wl = ((range.max || 0) + (range.min || 0)) / 2;
+    if (window.simpleViewerData) {
+        window.simpleViewerData.windowWidth = ww;
+        window.simpleViewerData.windowLevel = wl;
+    }
+    const wwInput = document.getElementById('windowWidth');
+    const wlInput = document.getElementById('windowLevel');
+    if (wwInput) wwInput.value = Math.round(ww);
+    if (wlInput) wlInput.value = Math.round(wl);
+    updateWindowRangeLabels();
+}
+
+function setWindowRangeFromWWL(ww, wl, modality = 'CT') {
+    const min = wl - ww / 2;
+    const max = wl + ww / 2;
+    if (modality === 'MR') {
+        mrWindowRange = { min, max };
+    } else {
+        ctWindowRange = { min, max };
+    }
+    updateWindowRangeLabels();
+}
+
+function updateWindowRangeLabels() {
+    const ctLabel = document.getElementById('ctWindowLabel');
+    if (ctLabel) ctLabel.textContent = `${Math.round(ctWindowRange.min)} to ${Math.round(ctWindowRange.max)}`;
+    const mrLabel = document.getElementById('mrWindowLabel');
+    if (mrLabel) mrLabel.textContent = `${Math.round(mrWindowRange.min)} to ${Math.round(mrWindowRange.max)}`;
+    const ctMin = document.getElementById('ctWindowMin');
+    const ctMax = document.getElementById('ctWindowMax');
+    if (ctMin && ctMax) {
+        ctMin.value = Math.round(ctWindowRange.min);
+        ctMax.value = Math.round(ctWindowRange.max);
+        updateDualRangeFill('ct');
+    }
+    const mrMin = document.getElementById('mrWindowMin');
+    const mrMax = document.getElementById('mrWindowMax');
+    if (mrMin && mrMax) {
+        mrMin.value = Math.round(mrWindowRange.min);
+        mrMax.value = Math.round(mrWindowRange.max);
+        updateDualRangeFill('mr');
+    }
+}
+
+function updateDualRangeFill(prefix) {
+    const minEl = document.getElementById(`${prefix}WindowMin`);
+    const maxEl = document.getElementById(`${prefix}WindowMax`);
+    const container = document.getElementById(`${prefix}WindowContainer`);
+    if (!minEl || !maxEl || !container) return;
+    const minVal = parseFloat(minEl.value);
+    const maxVal = parseFloat(maxEl.value);
+    const minBound = parseFloat(minEl.min);
+    const maxBound = parseFloat(minEl.max);
+    const range = maxBound - minBound;
+    if (!Number.isFinite(range) || range <= 0) return;
+    const start = ((Math.min(minVal, maxVal) - minBound) / range) * 100;
+    const end = ((Math.max(minVal, maxVal) - minBound) / range) * 100;
+    const trackColor = '#777777';
+    const bgColor = '#ffffff';
+    const grad = `linear-gradient(to right, ${bgColor} 0%, ${bgColor} ${start}%, ${trackColor} ${start}%, ${trackColor} ${end}%, ${bgColor} ${end}%, ${bgColor} 100%)`;
+    container.style.background = grad;
+    minEl.style.background = 'transparent';
+    maxEl.style.background = 'transparent';
+}
+
+function parseWindowFromDataset(ds) {
+    if (!ds) return null;
+    try {
+        const wwRaw = ds.string?.(Tag.WindowWidth);
+        const wlRaw = ds.string?.(Tag.WindowCenter);
+        const ww = wwRaw ? parseFloat(String(wwRaw).split('\\')[0]) : null;
+        const wl = wlRaw ? parseFloat(String(wlRaw).split('\\')[0]) : null;
+        if (Number.isFinite(ww) && Number.isFinite(wl)) return { width: ww, center: wl };
+    } catch (e) { /* ignore */ }
+    return null;
+}
+
+function setDefaultCTWindow(ds) {
+    const parsed = parseWindowFromDataset(ds);
+    const ww = parsed?.width || 400;
+    const wl = parsed?.center || 40;
+    const min = wl - ww / 2;
+    const max = wl + ww / 2;
+    ctDefaultWindowRange = { min, max };
+    ctWindowRange = { min, max };
+    updateWindowRangeLabels();
+    applyWindowForActiveTab();
+    if (window.simpleViewerData) displaySimpleViewer();
+}
+
+function enableRangeDrag(prefix) {
+    const container = document.getElementById(`${prefix}WindowContainer`);
+    const minEl = document.getElementById(`${prefix}WindowMin`);
+    const maxEl = document.getElementById(`${prefix}WindowMax`);
+    if (!container || !minEl || !maxEl) return;
+
+    let dragging = false;
+    let startX = 0;
+    let startMin = 0;
+    let startMax = 0;
+
+    const onMouseDown = (e) => {
+        if (e.target !== container) return; // only drag when grabbing the track (grey bar)
+        dragging = true;
+        startX = e.clientX;
+        startMin = parseFloat(minEl.value);
+        startMax = parseFloat(maxEl.value);
+        window.addEventListener('mousemove', onMouseMove);
+        window.addEventListener('mouseup', onMouseUp);
+        e.preventDefault();
+    };
+    const onMouseMove = (e) => {
+        if (!dragging) return;
+        const range = parseFloat(minEl.max) - parseFloat(minEl.min);
+        if (!Number.isFinite(range) || range <= 0) return;
+        const rect = container.getBoundingClientRect();
+        const deltaPx = e.clientX - startX;
+        const deltaVal = (deltaPx / rect.width) * range;
+        const width = startMax - startMin;
+        let newMin = startMin + deltaVal;
+        let newMax = startMax + deltaVal;
+        const minBound = parseFloat(minEl.min);
+        const maxBound = parseFloat(minEl.max);
+        if (newMin < minBound) {
+            newMin = minBound;
+            newMax = newMin + width;
+        }
+        if (newMax > maxBound) {
+            newMax = maxBound;
+            newMin = newMax - width;
+        }
+        minEl.value = newMin;
+        maxEl.value = newMax;
+        if (prefix === 'ct') {
+            ctWindowRange = { min: newMin, max: newMax };
+        } else {
+            mrWindowRange = { min: newMin, max: newMax };
+        }
+        updateWindowRangeLabels();
+        applyWindowForActiveTab();
+        displaySimpleViewer();
+    };
+    const onMouseUp = () => {
+        dragging = false;
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+    };
+
+    container.addEventListener('mousedown', onMouseDown);
+}
+
+function setDefaultMRWindow(stats, ds) {
+    // Prefer explicit MR window center/width if provided
+    const parsed = parseWindowFromDataset(ds);
+    if (parsed && Number.isFinite(parsed.width) && Number.isFinite(parsed.center)) {
+        const min = parsed.center - parsed.width / 2;
+        const max = parsed.center + parsed.width / 2;
+        mrWindowRange = { min, max };
+        mrDefaultWindowRange = { min, max };
+        updateWindowRangeLabels();
+        if (activeTab === 'mr') applyWindowForActiveTab();
+        return;
+    }
+    if (!stats) return;
+    // Fallback: typical MR viewing using percentiles
+    const min = Number.isFinite(stats.min) ? stats.min : -500;
+    const max = Number.isFinite(stats.p99) ? stats.p99 : (Number.isFinite(stats.p95) ? stats.p95 : min + 1000);
+    mrWindowRange = { min, max };
+    mrDefaultWindowRange = { min, max };
+    updateWindowRangeLabels();
+    if (activeTab === 'mr') {
+        applyWindowForActiveTab();
+    }
+}
+
+// Initialize dual-range drag once DOM is ready
+setTimeout(() => {
+    enableRangeDrag('ct');
+    enableRangeDrag('mr');
+    updateDualRangeFill('ct');
+    updateDualRangeFill('mr');
+}, 100);
+
+function resetCtWindow() {
+    const range = ctDefaultWindowRange || ctWindowRange;
+    if (range) {
+        ctWindowRange = { ...range };
+        updateWindowRangeLabels();
+        applyWindowForActiveTab();
         displaySimpleViewer();
     }
+}
+
+function resetMrWindow() {
+    const range = mrDefaultWindowRange || mrWindowRange;
+    if (range) {
+        mrWindowRange = { ...range };
+        updateWindowRangeLabels();
+        applyWindowForActiveTab();
+        displaySimpleViewer();
+        if (mrPreviewActive) setTimeout(() => { buildMRPreview(false); }, 0);
+    }
+}
+
+function onCtWindowRangeChange(which) {
+    const minEl = document.getElementById('ctWindowMin');
+    const maxEl = document.getElementById('ctWindowMax');
+    if (!minEl || !maxEl) return;
+    let minVal = which === 'min' ? parseInt(minEl.value) : ctWindowRange.min;
+    let maxVal = which === 'max' ? parseInt(maxEl.value) : ctWindowRange.max;
+    if (!Number.isFinite(minVal)) minVal = ctWindowRange.min;
+    if (!Number.isFinite(maxVal)) maxVal = ctWindowRange.max;
+    if (minVal >= maxVal) {
+        minVal = maxVal - 1;
+    }
+    ctWindowRange = { min: minVal, max: maxVal };
+    syncWindowInputsToActiveTab();
+    const displayingCT = !(activeTab === 'mr' && mrPreviewActive);
+    if (displayingCT) applyWindowForActiveTab();
+    displaySimpleViewer();
+    updateDualRangeFill('ct');
+}
+
+function onMrWindowRangeChange(which) {
+    const minEl = document.getElementById('mrWindowMin');
+    const maxEl = document.getElementById('mrWindowMax');
+    if (!minEl || !maxEl) return;
+    let minVal = which === 'min' ? parseInt(minEl.value) : mrWindowRange.min;
+    let maxVal = which === 'max' ? parseInt(maxEl.value) : mrWindowRange.max;
+    if (!Number.isFinite(minVal)) minVal = mrWindowRange.min;
+    if (!Number.isFinite(maxVal)) maxVal = mrWindowRange.max;
+    if (minVal >= maxVal) {
+        minVal = maxVal - 1;
+    }
+    mrWindowRange = { min: minVal, max: maxVal };
+    syncWindowInputsToActiveTab();
+    // No display impact; MR window only clamps resample if used elsewhere
 }
 
 function navigateToSlice(value) {
@@ -4050,4 +5622,42 @@ function showMessage(type, message) {
     setTimeout(() => {
         messageDiv.className = 'status-message';
     }, 5000);
+}
+function rebuildMrBlend() {
+    if (!mrResampledSlices || !mrResampledSlices.length || !ctFiles || !ctFiles.length) return mrResampledSlices || [];
+    const blended = [];
+    const blend = mrBlendFraction;
+    for (let i = 0; i < mrResampledSlices.length; i++) {
+        const mrSlice = mrResampledSlices[i];
+        const ctSlice = ctFiles[i];
+        const ds = ctSlice?.dataSet;
+        const pixelDataElement = ds?.elements?.x7fe00010;
+        if (!pixelDataElement || !mrSlice.huData) {
+            blended.push(mrSlice);
+            continue;
+        }
+        let ctPixels = null;
+        try {
+            ctPixels = new Int16Array(ctSlice.byteArray.buffer, pixelDataElement.dataOffset, pixelDataElement.length / 2);
+        } catch (e) {
+            blended.push(mrSlice);
+            continue;
+        }
+        const slope = ds.floatString(Tag.RescaleSlope) || 1;
+        const intercept = ds.floatString(Tag.RescaleIntercept) || 0;
+        const outHU = new Float32Array(ctPixels.length);
+        for (let px = 0; px < ctPixels.length; px++) {
+            const ctHU = ctPixels[px] * slope + intercept;
+            const mrHU = mrSlice.huData[px];
+            const fused = (1 - blend) * ctHU + blend * mrHU;
+            outHU[px] = Math.max(-1200, Math.min(2000, fused));
+        }
+        const modifiedPixelData = new Int16Array(outHU.length);
+        for (let px = 0; px < outHU.length; px++) {
+            modifiedPixelData[px] = Math.max(-32768, Math.min(32767, Math.round((outHU[px] - intercept) / slope)));
+        }
+        blended.push({ ...mrSlice, modifiedPixelData, huData: outHU });
+    }
+    mrBlendedSlices = blended;
+    return blended;
 }

@@ -15,6 +15,7 @@ Burn DICOM RTSTRUCT contours into CT image pixels to generate derived “annotat
 - ROI browser with show/hide and include/exclude for burn‑in.
   - Single‑click an ROI name to show/hide its overlay.
   - Double‑click an ROI name to navigate the views to its center.
+- MR Pad tab (v1.2): load CT + MR + rigid registration (REG) to resample MR into CT space, preview normalized MR pixels over CT, and export an MR-padded CT while preserving CT geometry/FOR.
 - Live preview when toggling “Include in burn‑in”:
   - White outline, accurate image‑pixel thickness.
   - Honors Solid/Dotted line style and Line Width.

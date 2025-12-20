@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ROI Override Tool | Medical Imaging</title>
-    <script>
+    <title>CT Pixel Override Tool | Medical Imaging</title>
+    <!-- <script>
         (function enforceRegistrationGate(){
             try {
                 var isRegistered = localStorage.getItem('roioverride_registered');
@@ -18,7 +18,7 @@
                 window.location.replace('gate/index.html' + qs2);
             }
         })();
-    </script>
+    </script> -->
     <link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO1bG1kAAAAASUVORK5CYII=" />
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -82,6 +82,39 @@
             display: flex;
             align-items: center;
             height: 56px;
+        }
+
+        /* Tab bar for RT vs MR flows */
+        .tab-bar {
+            display: flex;
+            gap: 8px;
+            padding: 10px 16px;
+            background: var(--primary-dark);
+            border-bottom: 1px solid var(--panel-border);
+        }
+
+        .tab-button {
+            background: var(--panel-bg);
+            color: var(--text-secondary);
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .tab-button:hover {
+            color: var(--text-primary);
+            border-color: var(--accent-primary);
+        }
+
+        .tab-button.active {
+            background: var(--accent-primary);
+            color: #ffffff;
+            border-color: var(--accent-primary);
+            box-shadow: 0 4px 10px rgba(0, 153, 153, 0.35);
         }
         
         .header-content {
@@ -155,6 +188,19 @@
         .sidebar-section {
             padding: 20px;
             border-bottom: 1px solid var(--panel-border);
+        }
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            border: 1px solid var(--panel-border);
+            background: rgba(255,255,255,0.05);
+            color: var(--text-secondary);
+            font-size: 11px;
+            margin: 4px 4px 0 0;
         }
         
         .section-header {
@@ -999,6 +1045,9 @@
         .modal-body { padding: 18px; overflow: auto; }
         .modal-body h3 { color: var(--accent-primary); font-size: 14px; margin: 14px 0 8px; }
         .modal-body p, .modal-body li, .modal-body ol { color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
+        .mr-series-option { width: 100%; padding: 10px 12px; margin: 6px 0; border-radius: 8px; border: 1px solid var(--input-border); background: var(--hover-bg); color: var(--text-primary); text-align: left; cursor: pointer; transition: all 0.2s ease; }
+        .mr-series-option:hover { border-color: var(--accent-primary); color: var(--accent-primary); }
+        .mr-series-meta { display:block; font-size:12px; color:var(--text-secondary); margin-top:2px; }
         .muted { color: var(--text-dim); font-size: 12px; }
     </style>
 </head>
@@ -1011,7 +1060,7 @@
             <div class="header-content">
                 <div class="logo-section">
                     <div class="logo">ROI</div>
-                    <div class="app-title">ROI Override Tool</div>
+                    <div class="app-title">CT Pixel Override Tool</div>
                 </div>
                 <div class="header-status">
                     <div class="patient-info-bar">
@@ -1034,7 +1083,12 @@
                 </div>
             </div>
         </div>
-        
+
+        <div class="tab-bar">
+            <button class="tab-button active" id="tabRtBtn" onclick="switchTab('rt')">Structure Burn-In</button>
+            <button class="tab-button" id="tabMrBtn" onclick="switchTab('mr')">MR Padding</button>
+        </div>
+
         <div class="main-layout">
             <div class="sidebar">
                 <div class="sidebar-section">
@@ -1042,31 +1096,40 @@
                     <div class="file-upload-area">
                         <input type="file" id="dicomFiles" multiple accept=".dcm" webkitdirectory directory>
                         <div class="upload-icon">📁</div>
-                        <div class="upload-text">Drop DICOM folder here</div>
-                        <div class="upload-hint">or click to browse</div>
+                        <div class="upload-text" id="ctUploadTitle">Drop CT + RS DICOM here</div>
+                        <div class="upload-hint" id="ctUploadHint">or click to browse CT + RS</div>
                     </div>
                 </div>
                 
                 <div class="sidebar-section">
                     <div class="section-header">View Controls</div>
                     <div class="view-controls">
-                        <div class="control-row">
-                            <label>Window:</label>
-                            <input type="number" id="windowWidth" value="400" onchange="updateWindowLevel()">
+                        <div class="control-row window-range-row" id="ctWindowRow">
+                            <label>CT Window Range:</label>
+                            <div class="window-range-body">
+                                <div class="dual-range-container" id="ctWindowContainer">
+                                    <input type="range" id="ctWindowMin" class="dual-range" min="-2000" max="4000" value="-160" oninput="onCtWindowRangeChange('min')">
+                                    <input type="range" id="ctWindowMax" class="dual-range dual-range-max" min="-2000" max="4000" value="240" oninput="onCtWindowRangeChange('max')">
+                                </div>
+                                <div id="ctWindowLabel" class="window-range-label">-160 to 240</div>
+                                <button class="window-reset-btn" type="button" onclick="resetCtWindow()">Reset CT WL</button>
+                            </div>
                         </div>
-                        <div class="control-row">
-                            <label>Level:</label>
-                            <input type="number" id="windowLevel" value="40" onchange="updateWindowLevel()">
-                        </div>
+                        <div class="control-row window-range-row" id="mrWindowRow" style="display:none;"></div>
                         <div class="control-row">
                             <label>Slice:</label>
                             <input type="range" id="sliceSlider" min="0" max="100" value="50" oninput="navigateToSlice(this.value)">
                             <span id="sliceInfo">50/100</span>
                         </div>
+                        <div class="control-row" id="mrBlendRow" style="display:none;">
+                            <label>Fusion Blend:</label>
+                            <input type="range" id="mrBlendSlider" min="0" max="100" value="100" class="width-slider" oninput="onMrBlendChange(this.value)">
+                            <span id="mrBlendValue">100% MR</span>
+                        </div>
                     </div>
                 </div>
                 
-                <div class="sidebar-section">
+                <div class="sidebar-section" id="rtStructureSection">
                     <div class="section-header">
                         RT Structure
                         <button class="toggle-all-btn" onclick="toggleAllStructures()">Show/Hide All</button>
@@ -1075,6 +1138,19 @@
                         <!-- ROI visibility toggles will be added here dynamically -->
                     </div>
                 </div>
+
+                <div class="sidebar-section" id="mrSummarySection" style="display:none;">
+                    <div class="section-header">MR Padding Status</div>
+                    <div id="mrStatusPills">
+                        <div class="pill" id="mrCtStatus">CT: not loaded</div>
+                        <div class="pill" id="mrImageStatus">MR: not loaded</div>
+                        <div class="pill" id="mrRegStatus">Reg: not loaded</div>
+                        <div class="pill" id="mrNormStatus">Norm: —</div>
+                    </div>
+                    <div class="upload-hint" id="mrPairLink" style="margin-top:8px;">No CT/MR pairing yet.</div>
+                    <div class="upload-hint" id="mrPairList" style="margin-top:6px; line-height:1.35;"></div>
+                </div>
+
                 <div class="sidebar-section">
                     <div class="section-header">Help</div>
                     <button class="add-roi-button" onclick="openHelpModal()">Help / About</button>
@@ -1111,9 +1187,9 @@
                     </div>
                     
                     <div class="viewport-container">
-                        <div class="viewport-label">Burn-In Controls</div>
+                        <div class="viewport-label" id="controlsViewportLabel">Burn-In Controls</div>
                         <div class="burn-controls">
-                            <div class="control-panel">
+                            <div class="control-panel" id="rtControls">
                                 <div class="control-row">
                                     <label class="control-label">ImageSet Name:</label>
                                     <input type="text" class="control-input" id="imageSetName" placeholder="Default Name CT_MMDDYY_Burn">
@@ -1197,6 +1273,45 @@
                                 </div>
                                 <div class="progress-text" id="progressText"></div>
                             </div>
+
+                            <div class="control-panel" id="mrControls" style="display:none;">
+                                <div class="control-row">
+                                    <label class="control-label">Output Name:</label>
+                                    <input type="text" class="control-input" id="mrOutputName" placeholder="CT_MRPad_v1.2">
+                                </div>
+                                <div class="control-row">
+                                    <label class="control-label">Registration:</label>
+                                    <div class="radio-group" style="gap:12px;flex-wrap:wrap;">
+                                        <label class="radio-option" style="gap:6px;">
+                                            <input type="radio" name="mrMatrixDir" value="mrct" checked>
+                                            <span>Matrix is MR→CT</span>
+                                        </label>
+                                        <label class="radio-option" style="gap:6px;">
+                                            <input type="radio" name="mrMatrixDir" value="ctmr">
+                                            <span>Matrix is CT→MR (invert)</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="control-row">
+                                    <label class="control-label">Interpolation:</label>
+                                    <select id="mrInterpolation" class="preset-select" style="min-width:160px;">
+                                        <option value="linear" selected>Trilinear</option>
+                                        <option value="nearest">Nearest</option>
+                                    </select>
+                                </div>
+                                <div class="control-row">
+                                    <label class="control-label">Status:</label>
+                                    <div id="mrStatusText" style="font-size:12px;color:var(--text-secondary);">Load CT, MR, and registration to begin.</div>
+                                </div>
+                                <div class="button-row">
+                                    <button class="preview-button" id="mrPreviewBtn" onclick="toggleMRPreview()">Preview MR→CT</button>
+                                    <button class="burn-button" id="mrExportBtn" onclick="exportMRPadded()">Export MR-padded CT</button>
+                                </div>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" id="mrProgressFill"></div>
+                                </div>
+                                <div class="progress-text" id="mrProgressText"></div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1211,7 +1326,7 @@
 
     <div class="preview-banner" id="previewBanner">Preview Mode</div>
 
-    <div class="version-badge" id="versionBadge">vDEV</div>
+    <div class="version-badge" id="versionBadge">v1.2</div>
 
     <script>
         // Initialize version/build badge from query params if provided by Electron
@@ -1271,7 +1386,7 @@
     <div class="modal-overlay" id="helpModal">
       <div class="modal-content">
         <div class="modal-header">
-          <div class="modal-title">ROI Override Tool — Help & About</div>
+          <div class="modal-title">CT Pixel Override Tool — Help & About</div>
           <button class="modal-close" title="Close" onclick="closeHelpModal()">×</button>
         </div>
         <div class="modal-body">
@@ -1289,6 +1404,12 @@
             <li>(Optional) Enable Overlay Fill or click <strong>Preview On</strong> to generate an in-memory burn before exporting.</li>
             <li>Click Burn & Export when satisfied with the preview.</li>
           </ol>
+
+          <h3>MR Pad (v1.2)</h3>
+          <ul>
+            <li>Switch to the MR Pad tab, load CT + MR + rigid registration (REG/SRO), then normalize MR and preview MR→CT.</li>
+            <li>Export an MR-padded CT that preserves CT geometry/FOR while replacing overlapping pixels with MR.</li>
+          </ul>
 
           <h3>Viewer Tips</h3>
           <ul>
@@ -1369,6 +1490,23 @@ SOFTWARE LICENSE
 14. Entire Agreement. This Agreement is the entire agreement of the parties as to the subject matter and supersedes all prior written and oral agreements and understandings relating to same. The Agreement may only be modified or amended in a writing signed by the parties.
 </pre>
           </details>
+        </div>
+      </div>
+    </div>
+
+    <!-- MR Series Selection Modal -->
+    <div class="modal-overlay" id="mrSeriesModal" style="display:none;">
+      <div class="modal-content">
+        <div class="modal-header">
+          <div class="modal-title" id="mrSeriesTitle">Choose MR Series</div>
+          <button class="modal-close" title="Close" onclick="closeMrSeriesModal()">×</button>
+        </div>
+        <div class="modal-body">
+          <p>Select which MR series to load for padding:</p>
+          <div id="mrSeriesList"></div>
+          <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:10px;">
+            <button class="window-reset-btn" type="button" onclick="closeMrSeriesModal()">Cancel</button>
+          </div>
         </div>
       </div>
     </div>
