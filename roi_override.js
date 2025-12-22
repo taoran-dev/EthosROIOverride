@@ -31,11 +31,55 @@ let currentMRSeries = null;
 let mrRegistrations = [];
 let mrToCtMatrix = null;
 let mrBlendFraction = 1.0; // 0=CT, 1=MR
+let mrBlendToggleSaved = null; // remembered blend for CT/MR keyboard toggle
+let mrPreviewPausedForManual = false;
+let mrInstantToggleActive = false; // true while holding Ctrl/Cmd + A
+let mrInstantTogglePrep = null; // promise for caching MR resample for instant toggle
+const ROI_HAND_CURSOR = "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'><g stroke='%23ff4044' stroke-width='2' fill='none' stroke-linecap='round'><path d='M16 4v8M16 20v8M4 16h8M20 16h8'/><path d='M12 8l4-4 4 4M12 24l4 4 4-4M8 12l-4 4 4 4M24 12l4 4-4 4'/><circle cx='16' cy='16' r='2' fill='%23ff4044'/></g></svg>\") 16 16, move";
 let ctWindowRange = { min: -160, max: 240 }; // defaults from 400/40
 let mrWindowRange = { min: -200, max: 800 };
 let ctDefaultWindowRange = { min: -160, max: 240 };
 let mrDefaultWindowRange = null;
 let mrWindowRebuildTimer = null;
+let mrManualRegMode = false;
+let mrManualRegLocked = false;
+let mrManualOffset = { x: 0, y: 0, z: 0 }; // patient coords (mm)
+let mrManualRotationRad = 0; // in-plane rotation around CT normal
+let mrManualSaved = null;
+let mrManualGeom = null;
+let mrManualDrag = null;
+let mrManualPreviewTimer = null;
+let mrManualOverlayCache = new Map();
+let mrManualAdjusted = false;
+const MANUAL_OVERLAY_SCALE = 0.6;
+let roiRefineBox = null; // {minX,maxX,minY,maxY,minZ,maxZ} in voxel indices (CT grid)
+let roiBoxEditMode = true;
+let roiBoxDrag = null;
+let mrRefinementAccepted = false;
+let mrRefineBaselineMatrix = null;
+let mrRefineHoldPrev = null;
+let pendingDisplayRAF = null;
+let roiDragThrottleTimer = null;
+let mrCompareActive = false;
+let mrRefineBaselineResampled = null;
+let mrRefineBaselineBlended = null;
+let mrRefineHoldPrevSlices = null;
+let mrRefineHoldPrevBlended = null;
+let roiOverlapInitDone = false;
+let mrRefinementRotDeg = 0;
+let mrRefinementRotVec = { x: 0, y: 0, z: 0 };
+let mrAcceptedRoiBox = null;
+let mrRefineCostHistory = [];
+let roiUiFrame = null;
+
+function translationMatrix(tx, ty, tz) {
+    return [
+        1, 0, 0, tx,
+        0, 1, 0, ty,
+        0, 0, 1, tz,
+        0, 0, 0, 1
+    ];
+}
 
 // Prevent external hooks from throwing (no-op placeholders)
 window.refreshMarkFromSeries = window.refreshMarkFromSeries || function(){};
@@ -102,6 +146,29 @@ let previewVolumeData = null;
 let previewRestoreState = null;
 let previewRestoreToggle = null;
 let previewRegenTimer = null;
+let mrRefinementDelta = { x: 0, y: 0, z: 0 };
+
+// Initialize refine fold icon and cost plot placeholder once DOM is ready
+window.addEventListener('DOMContentLoaded', () => {
+    try {
+        const details = document.getElementById('mrRoiRefineDetails');
+        const icon = document.getElementById('mrRoiFoldIcon');
+        const updateIcon = () => {
+            if (icon && details) icon.textContent = details.open ? '▾' : '▸';
+            if (details?.open) {
+                updateRoiRefinementOptions();
+                displaySimpleViewer();
+            }
+        };
+        if (details) {
+            updateIcon();
+            details.addEventListener('toggle', updateIcon);
+        }
+        plotRefineCost(true);
+    } catch (e) {
+        console.warn('init refine fold icon failed:', e);
+    }
+});
 
 // Tab switching between RT burn and MR padding
 function switchTab(tab) {
@@ -137,6 +204,8 @@ function switchTab(tab) {
         if (blendValue) blendValue.textContent = `${Math.round(mrBlendFraction * 100)}% MR`;
         const blendRow = document.getElementById('mrBlendRow');
         if (blendRow) blendRow.style.display = 'flex';
+        const refineRow = document.getElementById('mrRoiRefineRow');
+        if (refineRow) refineRow.style.display = 'flex';
         const normToggle = document.getElementById('mrUseNormalization');
         if (normToggle) {
             normToggle.checked = false;
@@ -154,11 +223,16 @@ function switchTab(tab) {
         if (uploadHint) uploadHint.textContent = 'or click to browse CT + RS';
         const blendRow = document.getElementById('mrBlendRow');
         if (blendRow) blendRow.style.display = 'none';
+        const refineRow = document.getElementById('mrRoiRefineRow');
+        if (refineRow) refineRow.style.display = 'none';
         const mrRow = document.getElementById('mrWindowRow');
         if (mrRow) mrRow.style.display = 'none'; // RT burn only needs CT window control
         const ctRow = document.getElementById('ctWindowRow');
         if (ctRow) ctRow.style.display = 'flex';
     }
+    updateRoiRefinementOptions();
+    const regOverlay = document.getElementById('mrRegOverlay');
+    if (regOverlay) regOverlay.style.display = 'none';
 
     // Avoid RT preview artifacts when switching tabs
     if (target === 'mr' && window.previewMode) {
@@ -274,6 +348,51 @@ function parseRegistrationTransforms(dataSet) {
     return transforms;
 }
 
+function composeRegistrationTransforms(reg, ctFor = currentCTSeries?.forUID, mrFor = currentMRSeries?.forUID) {
+    if (!reg || !reg.transforms || !ctFor || !mrFor) return null;
+    const ctXform = reg.transforms.find(t => t.forUID === ctFor);
+    const mrXform = reg.transforms.find(t => t.forUID === mrFor);
+    if (!ctXform || !ctXform.matrix || !mrXform || !mrXform.matrix) return null;
+    const invCt = invertMatrix4(ctXform.matrix);
+    if (!invCt) return null;
+    return multiplyMatrix4(invCt, mrXform.matrix); // MR->CT = inv(CT->reg) * (MR->reg)
+}
+
+function chooseRegistrationForCurrentPair() {
+    const ctFor = currentCTSeries?.forUID;
+    const mrFor = currentMRSeries?.forUID;
+    const compose = (reg) => composeRegistrationTransforms(reg, ctFor, mrFor);
+    const candidates = mrRegistrations || [];
+    for (const reg of candidates) {
+        const hasTransforms = reg.transforms && reg.transforms.length >= 2;
+        if ((!reg.matrix && !hasTransforms) || !reg.forList || reg.forList.length < 2) continue;
+        const fromFOR = reg.forList[0];
+        const toFOR = reg.forList[1];
+        if (fromFOR === mrFor && toFOR === ctFor) {
+            const composed = compose(reg);
+            return { reg, matrix: composed || reg.matrix, inverted: false };
+        }
+        if (fromFOR === ctFor && toFOR === mrFor) {
+            const inv = invertMatrix4(reg.matrix);
+            const composed = compose(reg);
+            if (composed) return { reg, matrix: composed, inverted: false };
+            if (inv) return { reg, matrix: inv, inverted: true };
+        }
+        const composed = compose(reg);
+        if (composed) return { reg, matrix: composed, inverted: false };
+    }
+    const any = candidates.find(r => r.matrix || (r.transforms && r.transforms.length >= 2));
+    if (any) {
+        const composed = compose(any);
+        return { reg: any, matrix: composed || any.matrix, inverted: false };
+    }
+    if (mrRegistration) {
+        const composed = compose(mrRegistration);
+        return { reg: mrRegistration, matrix: composed || mrRegistration.matrix || mrToCtMatrix, inverted: false };
+    }
+    return { reg: null, matrix: mrToCtMatrix || null, inverted: false };
+}
+
 // HU Presets
 const HU_PRESETS = {
     "Air (-1000 HU)": -1000,
@@ -315,6 +434,44 @@ function getFooterNoteText() {
     if (!el) return '';
     const lines = String(el.value || '').split(/\r?\n/).slice(0, 5);
     return lines.join('\n').trim();
+}
+
+function formatDicomDateTime(dateStr, timeStr) {
+    if (!dateStr || dateStr.length < 8) return null;
+    const yyyy = dateStr.slice(0, 4);
+    const mm = dateStr.slice(4, 6);
+    const dd = dateStr.slice(6, 8);
+    const hh = (timeStr || '').padEnd(6, '0').slice(0, 2);
+    const mi = (timeStr || '').padEnd(6, '0').slice(2, 4);
+    const ss = (timeStr || '').padEnd(6, '0').slice(4, 6);
+    const iso = `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}`;
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? null : d.toLocaleString();
+}
+
+function getRegistrationTimestamp(reg = mrRegistration) {
+    if (!reg) return null;
+    const dateStr = reg.dataSet?.string?.('x00080012');
+    const timeStr = reg.dataSet?.string?.('x00080013');
+    const formatted = formatDicomDateTime(dateStr, timeStr);
+    if (formatted) return formatted;
+    if (reg.loadedAt instanceof Date && !Number.isNaN(reg.loadedAt.getTime())) {
+        return reg.loadedAt.toLocaleString();
+    }
+    return null;
+}
+
+function getRegistrationUser(reg = mrRegistration) {
+    if (!reg) return null;
+    try {
+        const op = reg.dataSet?.string?.('x00081070'); // OperatorsName
+        if (op && op.trim()) return op.trim();
+    } catch (e) { /* ignore */ }
+    try {
+        const perf = reg.dataSet?.string?.('x00080090'); // Referring Physician
+        if (perf && perf.trim()) return perf.trim();
+    } catch (e) { /* ignore */ }
+    return null;
 }
 
 // Build default series name like CT_MMDDYY_Burn
@@ -439,6 +596,7 @@ function clearAllData() {
         ctFiles = [];
         processedCTData = [];
         rtstructFile = null;
+        rtstructFiles = [];
         roiData = [];
         roiSettings = [];
         roiMasks = {};
@@ -460,6 +618,36 @@ function clearAllData() {
         mrVolume = null;
         mrStats = null;
         mrSelectedSeriesUID = null;
+        mrManualRegMode = false;
+        mrManualRegLocked = false;
+        mrManualOffset = { x: 0, y: 0, z: 0 };
+        mrManualRotationRad = 0;
+        mrManualSaved = null;
+        mrManualGeom = null;
+        mrManualDrag = null;
+        mrManualOverlayCache = new Map();
+        mrManualAdjusted = false;
+        mrRefinementDelta = { x: 0, y: 0, z: 0 };
+        mrRefinementAccepted = false;
+        mrRefinementRotDeg = 0;
+        mrRefineBaselineMatrix = null;
+        mrCompareActive = false;
+        mrRefineBaselineResampled = null;
+        mrRefineBaselineBlended = null;
+        mrRefineHoldPrev = null;
+        mrRefineHoldPrevSlices = null;
+        mrRefineHoldPrevBlended = null;
+        roiOverlapInitDone = false;
+        roiRefineBox = null;
+        roiBoxEditMode = true;
+        roiBoxDrag = null;
+        if (mrManualPreviewTimer) {
+            clearTimeout(mrManualPreviewTimer);
+            mrManualPreviewTimer = null;
+        }
+        mrPreviewPausedForManual = false;
+        const regOverlay = document.getElementById('mrRegOverlay');
+        if (regOverlay) regOverlay.style.display = 'none';
 
         // Reset viewport state
         if (typeof viewportState !== 'undefined') {
@@ -481,6 +669,7 @@ function clearAllData() {
         const status = document.getElementById('statusMessage');
         if (status) status.textContent = '';
         refreshMrStatusUI();
+        updateRoiRefinementOptions();
 
         // Clear canvases
         clearCanvasById('viewport-axial');
@@ -504,6 +693,20 @@ async function processDICOMFiles(files) {
     mrStats = null;
     currentCTSeries = null;
     currentMRSeries = null;
+    mrManualRegMode = false;
+    mrManualRegLocked = false;
+    mrManualOffset = { x: 0, y: 0, z: 0 };
+    mrManualRotationRad = 0;
+    mrManualGeom = null;
+    mrManualDrag = null;
+    mrManualSaved = null;
+    mrManualOverlayCache = new Map();
+    mrManualAdjusted = false;
+    mrRefinementDelta = { x: 0, y: 0, z: 0 };
+    mrPreviewPausedForManual = false;
+    roiRefineBox = null;
+    roiBoxEditMode = true;
+    roiBoxDrag = null;
     // Reset parsed RTSTRUCT marks
     if (window.RTSSMarks) {
         window.RTSSMarks.length = 0;
@@ -511,6 +714,7 @@ async function processDICOMFiles(files) {
     roiMasks = {};
     roiContoursSag = {};
     roiContoursCor = {};
+    updateRoiRefinementOptions();
     
     updateStatus('Processing DICOM files...');
     
@@ -701,6 +905,7 @@ function refreshMrStatusUI() {
         setText('mrNormStatus', 'Raw MR: —');
     }
     updateMrPairLink();
+    updateManualRegUI();
 }
 
 function updateMRProgress(value, text = '') {
@@ -715,14 +920,119 @@ function updateMrStatusText(message) {
     if (el) el.textContent = message;
 }
 
+function showRefineOverlay(message = 'Calculating new alignment…') {
+    const overlay = document.getElementById('mrRefineOverlay');
+    const status = document.getElementById('mrRefineOverlayStatus');
+    const metrics = document.getElementById('mrRefineOverlayMetrics');
+    if (status) status.textContent = message;
+    if (metrics) metrics.textContent = 'Cost: — | Iter: —';
+    if (overlay) overlay.style.display = 'flex';
+}
+
+function updateRefineOverlay(cost = null, iter = null) {
+    const metrics = document.getElementById('mrRefineOverlayMetrics');
+    if (metrics) {
+        const c = Number.isFinite(cost) ? cost.toFixed(4) : '—';
+        const it = Number.isFinite(iter) ? iter : '—';
+        metrics.textContent = `Cost: ${c} | Iter: ${it}`;
+    }
+}
+
+function hideRefineOverlay() {
+    const overlay = document.getElementById('mrRefineOverlay');
+    if (overlay) overlay.style.display = 'none';
+}
+
+function nextFrame() {
+    return new Promise(resolve => {
+        if (typeof requestAnimationFrame !== 'function') return resolve();
+        requestAnimationFrame(() => resolve());
+    });
+}
+
+function updateBlendUIOnly(pct) {
+    const clamped = Math.max(0, Math.min(100, Math.round(pct)));
+    const slider = document.getElementById('mrBlendSlider');
+    if (slider) slider.value = clamped;
+    const label = document.getElementById('mrBlendValue');
+    if (label) label.textContent = `${clamped}% MR`;
+    const regLabel = document.getElementById('mrRegBlendLabel');
+    if (regLabel) regLabel.textContent = `${clamped}% MR`;
+    const regSlider = document.getElementById('mrRegBlendSlider');
+    if (regSlider) regSlider.value = clamped;
+}
+
 function onMrBlendChange(val) {
     const pct = Math.max(0, Math.min(100, parseInt(val || '0', 10)));
     mrBlendFraction = pct / 100;
-    const label = document.getElementById('mrBlendValue');
-    if (label) label.textContent = `${pct}% MR`;
+    updateBlendUIOnly(pct);
+    updateManualRegUI();
+    if (mrManualRegMode) {
+        invalidateManualOverlayCache();
+        displaySimpleViewer();
+        return;
+    }
     rebuildMrBlend();
     window.volumeData = null; // force MPR rebuild with new blend
     displaySimpleViewer();
+}
+
+async function ensureInstantBlendPrepared() {
+    if (mrInstantTogglePrep) {
+        return mrInstantTogglePrep;
+    }
+    mrInstantTogglePrep = (async () => {
+        if (!ctFiles?.length || !mrSeries?.length) return false;
+        if (!mrResampledSlices || !mrResampledSlices.length) {
+            const res = await resampleMRToCT();
+            if (!res || !res.length) return false;
+            mrResampledSlices = res;
+        }
+        if (!mrBlendedSlices || !mrBlendedSlices.length) {
+            mrBlendedSlices = rebuildMrBlend();
+        }
+        return true;
+    })();
+    const ok = await mrInstantTogglePrep;
+    mrInstantTogglePrep = null;
+    return ok;
+}
+
+async function handleInstantBlendHold(isKeyDown) {
+    if (activeTab !== 'mr') return;
+    if (!ctFiles?.length || !mrSeries?.length) return;
+    if (isKeyDown) {
+        if (mrInstantToggleActive) return;
+        const ready = await ensureInstantBlendPrepared();
+        if (!ready) return;
+        mrInstantToggleActive = true;
+        mrBlendToggleSaved = mrBlendFraction;
+        // Show CT only, keep caches warm
+        mrBlendFraction = 0;
+        mrPreviewActive = false;
+        updateBlendUIOnly(0);
+        const btn = document.getElementById('mrPreviewBtn');
+        if (btn) btn.textContent = 'Preview MR→CT';
+        window.volumeData = null;
+        displaySimpleViewer();
+    } else {
+        if (!mrInstantToggleActive) return;
+        const ready = await ensureInstantBlendPrepared();
+        if (!ready) {
+            mrInstantToggleActive = false;
+            return;
+        }
+        mrInstantToggleActive = false;
+        mrPreviewActive = true;
+        mrBlendFraction = 1.0;
+        mrBlendToggleSaved = 1.0;
+        mrBlendedSlices = rebuildMrBlend();
+        updateBlendUIOnly(100);
+        const btn = document.getElementById('mrPreviewBtn');
+        if (btn) btn.textContent = 'Preview Off';
+        window.volumeData = null;
+        displaySimpleViewer();
+    }
 }
 
 function shortUID(uid) {
@@ -775,6 +1085,555 @@ function updateMrPairLink() {
     }
 }
 
+function hasManualOffset() {
+    return Math.abs(mrManualOffset.x) > 1e-3 || Math.abs(mrManualOffset.y) > 1e-3 || Math.abs(mrManualOffset.z) > 1e-3;
+}
+
+function hasManualAdjustment() {
+    return hasManualOffset() || Math.abs(mrManualRotationRad) > (Math.PI / 180 * 0.1);
+}
+
+function projectManualOffset(offset = mrManualOffset) {
+    const geom = mrManualGeom || buildCtGeometry();
+    const rowCos = normalizeVec3(geom?.rowCos || [0, 1, 0]);
+    const colCos = normalizeVec3(geom?.colCos || [1, 0, 0]);
+    const norm = normalizeVec3(geom?.normal || [0, 0, 1]);
+    const vec = [offset?.x || 0, offset?.y || 0, offset?.z || 0];
+    return {
+        col: dot3(vec, colCos),
+        row: dot3(vec, rowCos),
+        z: dot3(vec, norm)
+    };
+}
+
+function formatManualOffsetSummary(offset = mrManualOffset) {
+    const proj = projectManualOffset(offset);
+    const parts = [];
+    const fmt = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} mm`;
+    parts.push(`Δx ${fmt(proj.col || 0)}`);
+    parts.push(`Δy ${fmt(proj.row || 0)}`);
+    if (Math.abs(proj.z || 0) > 0.05) {
+        parts.push(`Δz ${fmt(proj.z)}`);
+    }
+    return parts.join(', ');
+}
+
+function invalidateManualOverlayCache() {
+    try {
+        if (mrManualOverlayCache && typeof mrManualOverlayCache.clear === 'function') {
+            mrManualOverlayCache.clear();
+        } else {
+            mrManualOverlayCache = new Map();
+        }
+    } catch (e) {
+        mrManualOverlayCache = new Map();
+    }
+}
+
+function formatManualAdjustmentSummary() {
+    const parts = [];
+    if (hasManualOffset()) parts.push(formatManualOffsetSummary());
+    const deg = mrManualRotationRad * 180 / Math.PI;
+    if (Math.abs(deg) > 0.05) parts.push(`Rotate ${deg >= 0 ? '+' : ''}${deg.toFixed(1)}°`);
+    if (!parts.length) return 'Not adjusted';
+    return parts.join(' | ');
+}
+
+function updateManualRegUI() {
+    const overlay = document.getElementById('mrRegOverlay');
+    if (overlay) overlay.style.display = 'none';
+    const statusEl = document.getElementById('mrManualStatus');
+    if (statusEl) {
+        statusEl.textContent = 'Manual registration disabled. Use VOI refinement.';
+        statusEl.style.color = 'var(--text-secondary)';
+    }
+    const resetBtn = document.getElementById('mrManualResetBtn');
+    if (resetBtn) resetBtn.disabled = true;
+    const startBtn = document.getElementById('mrManualStartBtn');
+    if (startBtn) {
+        startBtn.textContent = 'Manual disabled';
+        startBtn.disabled = true;
+    }
+    const blendLabel = document.getElementById('mrRegBlendLabel');
+    if (blendLabel) blendLabel.textContent = `${Math.round(mrBlendFraction * 100)}% MR`;
+    const blendSlider = document.getElementById('mrRegBlendSlider');
+    if (blendSlider) blendSlider.value = Math.round(mrBlendFraction * 100);
+    const previewBtn = document.getElementById('mrPreviewBtn');
+    if (previewBtn) {
+        previewBtn.disabled = !!mrManualRegMode;
+        previewBtn.title = mrManualRegMode ? 'Preview refreshes after you confirm manual registration.' : '';
+    }
+}
+
+function onMrRegOverlayBlendChange(val) {
+    onMrBlendChange(val);
+}
+
+async function enterManualRegistration() {
+    mrManualRegMode = false;
+    mrManualRegLocked = false;
+    showMessage('info', 'Manual registration disabled. Use VOI-based refinement instead.');
+    updateMrStatusText('Manual registration disabled. Use VOI refinement with an RT ROI.');
+    updateManualRegUI();
+}
+
+function cancelManualRegistration() {
+    const saved = mrManualSaved;
+    const restorePreview = mrPreviewPausedForManual;
+    mrManualRegMode = false;
+    mrManualRegLocked = false;
+    mrManualDrag = null;
+    mrManualGeom = null;
+    if (saved && saved.offset) {
+        mrManualOffset = { ...saved.offset };
+    } else {
+        mrManualOffset = { x: 0, y: 0, z: 0 };
+    }
+    if (saved && saved.matrix) {
+        mrToCtMatrix = [...saved.matrix];
+    }
+    mrManualRotationRad = saved && typeof saved.rotation === 'number' ? saved.rotation : 0;
+    if (saved && typeof saved.blend === 'number') {
+        onMrBlendChange(Math.round(saved.blend * 100));
+    }
+    mrManualSaved = null;
+    mrManualAdjusted = hasManualAdjustment();
+    mrPreviewPausedForManual = false;
+    invalidateManualOverlayCache();
+    const overlay = document.getElementById('mrRegOverlay');
+    if (overlay) overlay.style.display = 'none';
+    updateManualRegUI();
+    updateMrStatusText('Manual registration canceled.');
+    if (restorePreview || mrPreviewActive) {
+        scheduleManualPreviewRebuild(true);
+    }
+}
+
+function resetManualRegistrationOffsets() {
+    mrManualOffset = { x: 0, y: 0, z: 0 };
+    mrManualRotationRad = 0;
+    mrManualRegLocked = false;
+    mrManualAdjusted = hasManualAdjustment();
+    invalidateManualOverlayCache();
+    updateManualRegUI();
+    if (mrPreviewActive || mrManualRegMode) scheduleManualPreviewRebuild(false);
+}
+
+async function acceptRoiRefinement() {
+    const rotMag = Math.max(Math.abs(mrRefinementRotVec.x || 0), Math.abs(mrRefinementRotVec.y || 0), Math.abs(mrRefinementRotVec.z || 0));
+    if (!mrRefinementDelta || (Math.abs(mrRefinementDelta.x) < 1e-3 && Math.abs(mrRefinementDelta.y) < 1e-3 && Math.abs(mrRefinementDelta.z) < 1e-3 && rotMag < 0.05)) {
+        showMessage('info', 'Run VOI-based registration before accepting.');
+        return;
+    }
+    const vol = buildCtGeometry();
+    mrAcceptedRoiBox = vol ? clampRoiBox(roiRefineBox, vol) : (roiRefineBox || null);
+    mrRefinementAccepted = true;
+    updateRoiRefinementOptions();
+    updateMrStatusText('Refinement accepted. Notes will include VOI Δ.');
+    showMessage('success', 'VOI refinement accepted and locked for burn-in notes.');
+    // Refresh burn-in preview with new refinement metadata
+    await buildMRPreview(false);
+}
+
+async function holdRefineCompare(isHolding) {
+    if (!mrRefineBaselineMatrix || !mrToCtMatrix) return;
+    if (isHolding) {
+        // Build baseline slices once for instant compare
+        if (!mrRefineBaselineResampled || !mrRefineBaselineResampled.length) {
+            const savedMatrix = mrToCtMatrix ? [...mrToCtMatrix] : null;
+            const savedRes = mrResampledSlices;
+            const savedBlend = mrBlendedSlices;
+            const savedPreview = mrPreviewActive;
+            mrToCtMatrix = [...mrRefineBaselineMatrix];
+            const res = await resampleMRToCT();
+            mrRefineBaselineResampled = res || [];
+            mrRefineBaselineBlended = [];
+            mrToCtMatrix = savedMatrix;
+            mrResampledSlices = savedRes;
+            mrBlendedSlices = savedBlend;
+            mrPreviewActive = savedPreview;
+        }
+        mrRefineHoldPrev = mrToCtMatrix ? [...mrToCtMatrix] : null;
+        mrRefineHoldPrevSlices = mrResampledSlices;
+        mrRefineHoldPrevBlended = mrBlendedSlices;
+        mrCompareActive = true;
+        if (mrRefineBaselineResampled?.length) {
+            mrResampledSlices = mrRefineBaselineResampled;
+            mrBlendedSlices = mrRefineBaselineBlended && mrRefineBaselineBlended.length ? mrRefineBaselineBlended : mrRefineBaselineResampled;
+            mrPreviewActive = true;
+        } else {
+            mrToCtMatrix = [...mrRefineBaselineMatrix];
+            await buildMRPreview(false);
+        }
+        // Force MPR volumes to rebuild from the baseline set for all views
+        window.volumeData = null;
+    } else {
+        mrCompareActive = false;
+        if (mrRefineHoldPrev) mrToCtMatrix = [...mrRefineHoldPrev];
+        if (mrRefineHoldPrevSlices) mrResampledSlices = mrRefineHoldPrevSlices;
+        if (mrRefineHoldPrevBlended) mrBlendedSlices = mrRefineHoldPrevBlended;
+        mrRefineHoldPrev = null;
+        mrRefineHoldPrevSlices = null;
+        mrRefineHoldPrevBlended = null;
+        // Rebuild volumes using the active refined set
+        window.volumeData = null;
+    }
+    displaySimpleViewer();
+}
+
+function resetRegistrationToFile() {
+    const selection = chooseRegistrationForCurrentPair();
+    const baseMatrix = selection?.matrix || mrRefineBaselineMatrix || composeRegistrationTransforms(mrRegistration) || mrRegistration?.matrix;
+    if (!baseMatrix) {
+        showMessage('error', 'No original registration matrix available to reset.');
+        return;
+    }
+    mrToCtMatrix = [...baseMatrix];
+    mrRefineBaselineMatrix = [...baseMatrix];
+    mrRefinementDelta = { x: 0, y: 0, z: 0 };
+    mrRefinementAccepted = false;
+    mrRefinementRotDeg = 0;
+    mrCompareActive = false;
+    mrRefineBaselineResampled = null;
+    mrRefineBaselineBlended = null;
+    mrRefineHoldPrev = null;
+    mrRefineHoldPrevSlices = null;
+    mrRefineHoldPrevBlended = null;
+    mrPreviewActive = false;
+    mrResampledSlices = [];
+    mrBlendedSlices = [];
+    window.volumeData = null;
+    updateRoiRefinementOptions();
+    updateMrStatusText('Registration reset to file-loaded matrix.');
+    showMessage('info', 'Registration reset to file-loaded matrix.');
+    buildMRPreview(false);
+}
+
+function plotRefineCost(forceAxes = false) {
+    const canvas = document.getElementById('mrRefineCostPlot');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const w = canvas.width = canvas.clientWidth || 300;
+    const h = canvas.height = canvas.clientHeight || 80;
+    ctx.clearRect(0, 0, w, h);
+    // axes/background
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(42, 12);
+    ctx.lineTo(42, h - 22);
+    ctx.lineTo(w - 12, h - 22);
+    ctx.stroke();
+    // ticks/labels
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '10px sans-serif';
+    ctx.textBaseline = 'top';
+    // axis titles outside
+    ctx.fillText('iter', w - 36, h - 4); // title pushed below ticks
+    ctx.save();
+    ctx.translate(4, 14); // farther left
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText('MI cost', 0, 0);
+    ctx.restore();
+    // Y ticks: min/mid/max if data exists
+    const vals = mrRefineCostHistory && mrRefineCostHistory.length ? mrRefineCostHistory : [];
+    if (vals.length || forceAxes) {
+        const minVal = vals.length ? Math.min(...vals) : 0;
+        const maxVal = vals.length ? Math.max(...vals) : 1;
+        const midVal = (minVal + maxVal) / 2;
+        const tickY = (val) => h - 22 - ((val - minVal) / Math.max(1e-6, maxVal - minVal)) * (h - 36);
+        ctx.fillText(maxVal.toFixed(2), 4, tickY(maxVal) - 6);
+        ctx.fillText(midVal.toFixed(2), 4, tickY(midVal) - 6);
+        ctx.fillText(minVal.toFixed(2), 4, tickY(minVal) - 6);
+        // X ticks every ~200 iterations
+        const maxIter = Math.max(1, vals.length);
+        const stepIter = 200;
+        for (let i = 0; i <= maxIter; i += stepIter) {
+            const x = 42 + (i / Math.max(1, maxIter)) * (w - 54);
+            ctx.fillText(String(i), x - 6, h - 18);
+        }
+        if (maxIter % stepIter !== 0) {
+            const x = 42 + (maxIter / Math.max(1, maxIter)) * (w - 54);
+            ctx.fillText(String(maxIter), x - 8, h - 18);
+        }
+    }
+
+    if (!mrRefineCostHistory || (!mrRefineCostHistory.length && !forceAxes)) return;
+
+    const plotVals = mrRefineCostHistory && mrRefineCostHistory.length ? mrRefineCostHistory : [0];
+    const min = Math.min(...plotVals);
+    const max = Math.max(...plotVals);
+    const span = Math.max(1e-6, max - min);
+    ctx.strokeStyle = '#00f5ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    plotVals.forEach((v, idx) => {
+        const x = 42 + (idx / Math.max(1, plotVals.length - 1)) * (w - 54);
+        const y = h - 22 - ((v - min) / span) * (h - 36);
+        if (idx === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+}
+
+async function confirmManualRegistration() {
+    const shouldRefreshPreview = mrPreviewPausedForManual || mrPreviewActive;
+    mrManualRegMode = false;
+    mrManualRegLocked = true;
+    mrManualDrag = null;
+    mrManualGeom = mrManualGeom || buildCtGeometry();
+    mrManualSaved = null;
+    mrManualAdjusted = hasManualAdjustment();
+    mrPreviewPausedForManual = false;
+    invalidateManualOverlayCache();
+    const overlay = document.getElementById('mrRegOverlay');
+    if (overlay) overlay.style.display = 'none';
+    updateManualRegUI();
+    updateMrStatusText('Manual registration locked. Preview refreshing with applied offsets.');
+    if (shouldRefreshPreview) await scheduleManualPreviewRebuild(true);
+    else displaySimpleViewer();
+}
+
+function screenToImageCoords(viewName, screenX, screenY) {
+    const geom = window.viewGeom && window.viewGeom[viewName];
+    if (!geom) return null;
+    const cx = geom.canvasWidth / 2;
+    const cy = geom.canvasHeight / 2;
+    const baseX = ((screenX - cx - (geom.panX || 0)) / (geom.zoom || 1)) + cx;
+    const baseY = ((screenY - cy - (geom.panY || 0)) / (geom.zoom || 1)) + cy;
+    const scaleX = geom.displayWidth / geom.dataWidth;
+    const scaleY = geom.displayHeight / geom.dataHeight;
+    let dataX = ((baseX - geom.offsetX) / scaleX) - 0.5;
+    const dataY = ((baseY - geom.offsetY) / scaleY) - 0.5;
+    if (geom.flipX) {
+        dataX = (geom.dataWidth - 1) - dataX;
+    }
+    return { dataX, dataY };
+}
+
+function getProjectedBoxForPlane(box, plane, volume) {
+    if (!box || !volume) return null;
+    const b = clampRoiBox(box, volume);
+    if (plane === 'axial') {
+        return { x0: b.minX, x1: b.maxX + 1, y0: b.minY, y1: b.maxY + 1 };
+    }
+    if (plane === 'sagittal') {
+        return { x0: b.minY, x1: b.maxY + 1, y0: (volume.depth - 1 - b.maxZ), y1: (volume.depth - 1 - b.minZ) + 1 };
+    }
+    if (plane === 'coronal') {
+        return { x0: b.minX, x1: b.maxX + 1, y0: (volume.depth - 1 - b.maxZ), y1: (volume.depth - 1 - b.minZ) + 1 };
+    }
+    return null;
+}
+
+function detectRoiEdgeHit(plane, dataX, dataY, volume, tolerance = 8) {
+    const refineOpen = document.getElementById('mrRoiRefineDetails')?.open || false;
+    if (!volume || activeTab !== 'mr' || roiBoxEditMode === false || !refineOpen) return null;
+    const proj = getProjectedBoxForPlane(roiRefineBox, plane, volume);
+    if (!proj) return null;
+    const edges = {};
+    if (Math.abs(dataX - proj.x0) <= tolerance) edges.x0 = true;
+    if (Math.abs(dataX - proj.x1) <= tolerance) edges.x1 = true;
+    if (Math.abs(dataY - proj.y0) <= tolerance) edges.y0 = true;
+    if (Math.abs(dataY - proj.y1) <= tolerance) edges.y1 = true;
+    const hit = Object.keys(edges).length > 0;
+    if (!hit) return null;
+    return { edges };
+}
+
+function getResizeCursor(edgeHit) {
+    if (!edgeHit || !edgeHit.edges) return 'crosshair';
+    const e = edgeHit.edges;
+    const hasX0 = !!e.x0, hasX1 = !!e.x1, hasY0 = !!e.y0, hasY1 = !!e.y1;
+    // Corners
+    if ((hasX0 && hasY0) || (hasX1 && hasY1)) return 'nwse-resize';
+    if ((hasX0 && hasY1) || (hasX1 && hasY0)) return 'nesw-resize';
+    // Edges
+    if (hasX0 || hasX1) return 'ew-resize';
+    if (hasY0 || hasY1) return 'ns-resize';
+    return 'crosshair';
+}
+
+function getEdgeTolerance(viewName) {
+    const geom = window.viewGeom && window.viewGeom[viewName];
+    if (!geom) return 10;
+    const scaleX = geom.dataWidth && geom.displayWidth ? (geom.dataWidth / geom.displayWidth) : 1;
+    const scaleY = geom.dataHeight && geom.displayHeight ? (geom.dataHeight / geom.displayHeight) : 1;
+    const pxTol = 12; // pixels
+    const dataTolX = pxTol * scaleX;
+    const dataTolY = pxTol * scaleY;
+    return Math.max(6, Math.round(Math.max(dataTolX, dataTolY)));
+}
+
+function dataToScreen(viewName, dataX, dataY) {
+    const geom = window.viewGeom && window.viewGeom[viewName];
+    if (!geom) return null;
+    const scaleX = geom.displayWidth / geom.dataWidth;
+    const scaleY = geom.displayHeight / geom.dataHeight;
+    const xCoord = geom.flipX ? (geom.dataWidth - 1 - dataX) : dataX;
+    const baseX = geom.offsetX + (xCoord + 0.5) * scaleX;
+    const baseY = geom.offsetY + (dataY + 0.5) * scaleY;
+    const cx = geom.canvasWidth / 2;
+    const cy = geom.canvasHeight / 2;
+    const screenX = (baseX - cx) * (geom.zoom || 1) + cx + (geom.panX || 0);
+    const screenY = (baseY - cy) * (geom.zoom || 1) + cy + (geom.panY || 0);
+    return { x: screenX, y: screenY };
+}
+
+function detectRoiEdgeHitScreen(viewName, screenX, screenY, volume) {
+    const refineOpen = document.getElementById('mrRoiRefineDetails')?.open || false;
+    if (!volume || activeTab !== 'mr' || roiBoxEditMode === false || !refineOpen) return null;
+    const proj = getProjectedBoxForPlane(roiRefineBox, viewName, volume);
+    if (!proj) return null;
+    const topLeft = dataToScreen(viewName, proj.x0, proj.y0);
+    const bottomRight = dataToScreen(viewName, proj.x1, proj.y1);
+    if (!topLeft || !bottomRight) return null;
+    const minX = Math.min(topLeft.x, bottomRight.x);
+    const maxX = Math.max(topLeft.x, bottomRight.x);
+    const minY = Math.min(topLeft.y, bottomRight.y);
+    const maxY = Math.max(topLeft.y, bottomRight.y);
+    const tolPx = 18;
+    const edges = {};
+    if (Math.abs(screenX - minX) <= tolPx) edges.x0 = true;
+    if (Math.abs(screenX - maxX) <= tolPx) edges.x1 = true;
+    if (Math.abs(screenY - minY) <= tolPx) edges.y0 = true;
+    if (Math.abs(screenY - maxY) <= tolPx) edges.y1 = true;
+    if (!Object.keys(edges).length) return null;
+    return { edges };
+}
+
+function isPointInsideRoi(plane, dataX, dataY, volume, padding = 2) {
+    if (!volume || activeTab !== 'mr' || roiBoxEditMode === false) return false;
+    const refineOpen = document.getElementById('mrRoiRefineDetails')?.open || false;
+    if (!refineOpen) return false;
+    const proj = getProjectedBoxForPlane(roiRefineBox, plane, volume);
+    if (!proj) return false;
+    return dataX >= (proj.x0 - padding) && dataX <= (proj.x1 + padding) &&
+        dataY >= (proj.y0 - padding) && dataY <= (proj.y1 + padding);
+}
+
+function isPointInsideRoiScreen(viewName, screenX, screenY, volume, innerPaddingPx = 24) {
+    const refineOpen = document.getElementById('mrRoiRefineDetails')?.open || false;
+    if (!volume || activeTab !== 'mr' || roiBoxEditMode === false || !refineOpen) return false;
+    const proj = getProjectedBoxForPlane(roiRefineBox, viewName, volume);
+    if (!proj) return false;
+    const topLeft = dataToScreen(viewName, proj.x0, proj.y0);
+    const bottomRight = dataToScreen(viewName, proj.x1, proj.y1);
+    if (!topLeft || !bottomRight) return false;
+    const minX = Math.min(topLeft.x, bottomRight.x) + innerPaddingPx;
+    const maxX = Math.max(topLeft.x, bottomRight.x) - innerPaddingPx;
+    const minY = Math.min(topLeft.y, bottomRight.y) + innerPaddingPx;
+    const maxY = Math.max(topLeft.y, bottomRight.y) - innerPaddingPx;
+    if (minX > maxX || minY > maxY) return false;
+    return screenX >= minX && screenX <= maxX && screenY >= minY && screenY <= maxY;
+}
+
+function scheduleManualPreviewRebuild(immediate = false) {
+    return new Promise((resolve) => {
+        if (mrManualPreviewTimer) clearTimeout(mrManualPreviewTimer);
+        const run = async () => {
+            mrManualPreviewTimer = null;
+            if (!ctFiles || !ctFiles.length || !mrSeries || !mrSeries.length) {
+                resolve(false);
+                return;
+            }
+            if (mrManualRegMode) {
+                displaySimpleViewer();
+                resolve(true);
+                return;
+            }
+            try {
+                await buildMRPreview(false);
+            } catch (e) {
+                console.warn('Manual preview rebuild failed', e);
+            }
+            resolve(true);
+        };
+        if (immediate) run();
+        else mrManualPreviewTimer = setTimeout(run, 140);
+    });
+}
+
+function nudgeManualRegistration(key, stepMm = 1) {
+    const geom = mrManualGeom || buildCtGeometry();
+    if (!geom) return;
+    const step = Math.max(0, Number(stepMm) || 0);
+    const colUnit = normalizeVec3(geom.colCos || [1, 0, 0]); // screen left/right
+    const rowUnit = normalizeVec3(geom.rowCos || [0, 1, 0]); // screen up/down
+    let delta = [0, 0, 0];
+    if (key === 'arrowleft') delta = colUnit.map(v => -step * v);
+    else if (key === 'arrowright') delta = colUnit.map(v => step * v);
+    else if (key === 'arrowup') delta = rowUnit.map(v => -step * v);
+    else if (key === 'arrowdown') delta = rowUnit.map(v => step * v);
+    mrManualOffset = {
+        x: mrManualOffset.x + delta[0],
+        y: mrManualOffset.y + delta[1],
+        z: mrManualOffset.z + delta[2]
+    };
+    mrManualRegLocked = false;
+    mrManualAdjusted = hasManualAdjustment();
+    invalidateManualOverlayCache();
+    updateManualRegUI();
+    scheduleManualPreviewRebuild(false);
+}
+
+async function toggleCtMrDisplayShortcut() {
+    // Toggle CT-only vs MR preview display via keyboard, preserving the last blend
+    if (activeTab !== 'mr') return;
+    if (!ctFiles?.length || !mrSeries?.length) return;
+
+    // If preview is on, switch to CT-only but remember current blend
+    if (mrPreviewActive) {
+        if (mrBlendFraction > 0.001) mrBlendToggleSaved = mrBlendFraction;
+        await toggleMRPreview();
+        return;
+    }
+
+    // If preview is off, enable it and restore previous blend (or default to current)
+    const targetBlend = Number.isFinite(mrBlendToggleSaved) ? mrBlendToggleSaved : (mrBlendFraction || 1);
+    await toggleMRPreview();
+    const pct = Math.round(targetBlend * 100);
+    if (Math.abs(targetBlend - mrBlendFraction) > 1e-4) onMrBlendChange(pct);
+    mrBlendToggleSaved = targetBlend;
+}
+
+async function handleGlobalKeydown(event) {
+    try {
+        const active = document.activeElement;
+        const tag = (active?.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || active?.isContentEditable) return;
+    } catch (e) { /* ignore focus errors */ }
+    const key = (event.key || '').toLowerCase();
+    if ((event.ctrlKey || event.metaKey) && key === 'a') {
+        event.preventDefault();
+        await handleInstantBlendHold(true);
+        return;
+    }
+    if (mrManualRegMode && (key === 'arrowleft' || key === 'arrowright' || key === 'arrowup' || key === 'arrowdown')) {
+        event.preventDefault();
+        const step = event.shiftKey ? 5 : 1;
+        nudgeManualRegistration(key, step);
+    }
+}
+
+document.addEventListener('keydown', handleGlobalKeydown);
+document.addEventListener('keyup', (event) => {
+    try {
+        const active = document.activeElement;
+        const tag = (active?.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || active?.isContentEditable) return;
+    } catch (e) { /* ignore focus errors */ }
+    const key = (event.key || '').toLowerCase();
+    if ((event.ctrlKey || event.metaKey) && key === 'a') {
+        event.preventDefault();
+        handleInstantBlendHold(false);
+    } else if (key === 'control' || key === 'meta') {
+        // If modifier is released while holding A, ensure we restore MR
+        handleInstantBlendHold(false);
+    }
+});
+
 // ---- MR Padding Flow ----
 async function processMRPackage(files) {
     mrSeries = [];
@@ -789,14 +1648,50 @@ async function processMRPackage(files) {
     mrToCtMatrix = null;
     currentCTSeries = null;
     currentMRSeries = null;
+    mrManualRegMode = false;
+    mrManualRegLocked = false;
+    mrManualOffset = { x: 0, y: 0, z: 0 };
+    mrManualRotationRad = 0;
+    mrManualGeom = null;
+    mrManualDrag = null;
+    mrManualOverlayCache = new Map();
+    mrManualAdjusted = false;
+    mrManualSaved = null;
+    mrPreviewPausedForManual = false;
+    mrRefinementDelta = { x: 0, y: 0, z: 0 };
+    mrRefinementAccepted = false;
+    mrRefineBaselineMatrix = null;
+    mrRefinementRotDeg = 0;
+    mrRefinementRotVec = { x: 0, y: 0, z: 0 };
+    mrAcceptedRoiBox = null;
+    mrCompareActive = false;
+    mrRefineBaselineResampled = null;
+    mrRefineBaselineBlended = null;
+    mrRefineHoldPrev = null;
+    mrRefineHoldPrevSlices = null;
+    mrRefineHoldPrevBlended = null;
+    mrCompareActive = false;
+    mrRefineBaselineResampled = null;
+    mrRefineBaselineBlended = null;
+    mrRefineHoldPrev = null;
+    mrRefineHoldPrevSlices = null;
+    mrRefineHoldPrevBlended = null;
+    roiOverlapInitDone = false;
+    roiRefineBox = null;
+    roiBoxEditMode = true;
+    roiBoxDrag = null;
 
     ctFiles = [];
     ctSeriesMap = {};
+    rtstructFile = null;
+    rtstructFiles = [];
     roiData = [];
     if (window.RTSSMarks) window.RTSSMarks.length = 0;
     roiMasks = {};
     roiContoursSag = {};
     roiContoursCor = {};
+    updateRoiRefinementOptions();
+    mrRefineBaselineMatrix = null;
 
     updateMrStatusText('Processing mixed CT/MR/REG files...');
     updateMRProgress(0, '');
@@ -827,11 +1722,19 @@ async function processMRPackage(files) {
                 const matrix = extractRegistrationMatrix(dataSet);
                 const forList = parseRegistrationForList(dataSet);
                 const transforms = parseRegistrationTransforms(dataSet);
-                const reg = { file, dataSet, matrix, forList, transforms };
+                const reg = { file, dataSet, matrix, forList, transforms, loadedAt: new Date() };
                 mrRegistrations.push(reg);
                 if (!mrRegistration && (matrix || (transforms && transforms.length))) {
                     mrRegistration = reg;
                 }
+            } else if (modalityValue === 'RTSTRUCT' || modalityValue === 'RTSS') {
+                let refSeries = null;
+                try {
+                    if (dataSet.elements.x30060010?.items?.[0]?.dataSet?.elements?.x30060012?.items?.[0]?.dataSet?.elements?.x30060014?.items?.[0]?.dataSet) {
+                        refSeries = dataSet.elements.x30060010.items[0].dataSet.elements.x30060012.items[0].dataSet.elements.x30060014.items[0].dataSet.string(Tag.SeriesInstanceUID);
+                    }
+                } catch (ex) { /* ignore */ }
+                rtstructFiles.push({ file, dataSet, arrayBuffer, byteArray, refSeriesUID: refSeries });
             }
         } catch (err) {
             console.error('Error reading DICOM file:', file?.name, err);
@@ -862,6 +1765,45 @@ async function processMRPackage(files) {
         forUID: firstCT?.string?.(Tag.FrameOfReferenceUID) || null
     };
     if (firstCT) setDefaultCTWindow(firstCT);
+    const ctGeomForBox = buildCtGeometry();
+    if (ctGeomForBox) {
+        initRoiRefineBoxFromVolume(ctGeomForBox);
+        updateRoiRefinementOptions();
+    }
+
+    // Select RTSTRUCT if provided (for VOI-driven refinement)
+    let chosenRT = null;
+    const rtForSeries = rtstructFiles.filter(r => r.refSeriesUID === chosenCT);
+    if (rtForSeries.length === 1) {
+        chosenRT = rtForSeries[0];
+    } else if (rtForSeries.length > 1) {
+        let msg = 'Multiple RTSTRUCTs referencing this CT found. Enter number:\n';
+        rtForSeries.forEach((r, idx) => {
+            const label = r.dataSet.string('x30060002') || r.dataSet.string('x0008103e') || `RTSTRUCT ${idx + 1}`;
+            msg += `${idx + 1}) ${label}\n`;
+        });
+        const ans = window.prompt(msg, '1');
+        const sel = Math.max(1, Math.min(rtForSeries.length, parseInt(ans || '1')));
+        chosenRT = rtForSeries[sel - 1];
+    } else if (rtstructFiles.length > 0) {
+        let msg = 'RTSTRUCT detected. Choose one to load for VOI refinement (or Cancel to skip):\n';
+        rtstructFiles.forEach((r, idx) => {
+            const label = r.dataSet.string('x30060002') || r.dataSet.string('x0008103e') || `RTSTRUCT ${idx + 1}`;
+            msg += `${idx + 1}) ${label}\n`;
+        });
+        const ans = window.prompt(msg, '');
+        if (ans) {
+            const sel = Math.max(1, Math.min(rtstructFiles.length, parseInt(ans || '1')));
+            chosenRT = rtstructFiles[sel - 1];
+        }
+    }
+    rtstructFile = chosenRT || null;
+    if (rtstructFile) {
+        extractROIData();
+    } else {
+        roiData = [];
+        updateRoiRefinementOptions();
+    }
 
     const mrKeys = Object.keys(mrSeriesMap);
     if (!mrKeys.length) {
@@ -902,6 +1844,11 @@ async function processMRPackage(files) {
             return hasCT && hasMR;
         }) || mrRegistrations[0];
         mrRegistration = regMatch;
+        const sel = chooseRegistrationForCurrentPair();
+        if (sel?.matrix) {
+            mrToCtMatrix = sel.matrix;
+            mrRefineBaselineMatrix = [...sel.matrix];
+        }
     }
 
     // Update header patient info using CT
@@ -920,7 +1867,8 @@ async function processMRPackage(files) {
         const seriesName = (ctSeriesMap[chosenCT]?.desc) ? ` [${ctSeriesMap[chosenCT].desc}]` : '';
         const mrName = (mrSeriesMap[chosenMR]?.desc) ? ` [${mrSeriesMap[chosenMR].desc}]` : '';
         const regText = mrRegistration ? ' + REG' : ' (REG missing)';
-        filesLoadedHeader.textContent = `${ctFiles.length} CT${seriesName}, ${mrSeries.length} MR${mrName}${regText}`;
+        const rtText = rtstructFile ? ', 1 RTSTRUCT' : '';
+        filesLoadedHeader.textContent = `${ctFiles.length} CT${seriesName}, ${mrSeries.length} MR${mrName}${rtText}${regText}`;
     }
 
     // Reset viewer data
@@ -941,9 +1889,11 @@ async function processMRPackage(files) {
     if (blendValue) blendValue.textContent = '100% MR';
     const blendRow = document.getElementById('mrBlendRow');
     if (blendRow && activeTab === 'mr') blendRow.style.display = 'flex';
+    updateRoiRefinementOptions();
 
     refreshMrStatusUI();
-    showMessage('success', 'Loaded CT + MR' + (mrRegistration ? ' + REG.' : '. REG missing.'));
+    const rtMsg = rtstructFile ? ' + RTSTRUCT' : '';
+    showMessage('success', 'Loaded CT + MR' + rtMsg + (mrRegistration ? ' + REG.' : '. REG missing.'));
 
     // Auto-build fused preview when CT/MR/REG are matched to allow immediate visual check
     try {
@@ -965,6 +1915,7 @@ async function loadMRSeries(files) {
     mrResampledSlices = [];
     mrPreviewActive = false;
     currentMRSeries = null;
+    mrRefinementDelta = { x: 0, y: 0, z: 0 };
     updateMrStatusText('Processing MR files...');
     updateMRProgress(0, '');
 
@@ -1043,7 +1994,17 @@ async function loadRegistrationFile(file) {
         }
         const forList = parseRegistrationForList(dataSet);
         const transforms = parseRegistrationTransforms(dataSet);
-        mrRegistration = { file, dataSet, matrix, forList, transforms };
+        mrRegistration = { file, dataSet, matrix, forList, transforms, loadedAt: new Date() };
+        mrToCtMatrix = matrix;
+        mrManualOffset = { x: 0, y: 0, z: 0 };
+        mrManualRotationRad = 0;
+        mrManualRegMode = false;
+        mrManualRegLocked = false;
+        mrManualAdjusted = false;
+        mrRefinementDelta = { x: 0, y: 0, z: 0 };
+        mrRefinementAccepted = false;
+        mrRefineBaselineMatrix = matrix ? [...matrix] : null;
+        invalidateManualOverlayCache();
         mrPreviewActive = false;
         mrResampledSlices = [];
         window.volumeData = null;
@@ -1293,7 +2254,9 @@ function buildCtGeometry() {
     const sliceSpacing = computeSliceSpacing(positions, normal, first.floatString('x00180050') || 1.0);
     const slope = first.floatString(Tag.RescaleSlope) || 1;
     const intercept = first.floatString(Tag.RescaleIntercept) || 0;
-    return { slices, width, height, depth: slices.length, rowSpacing, colSpacing, sliceSpacing, rowCos, colCos, normal, positions, slope, intercept };
+    // Include origin so worldToVoxel uses the correct CT frame when computing ROI bounds
+    const origin = positions[0];
+    return { slices, width, height, depth: slices.length, rowSpacing, colSpacing, sliceSpacing, rowCos, colCos, normal, positions, origin, slope, intercept };
 }
 
 function worldToVoxel(volume, point) {
@@ -1353,6 +2316,26 @@ function getMRControlsConfig() {
     return { useNormalization, targetHU, percentile, interpolation, matrixDir, outputName };
 }
 
+function buildRegistrationAnnotationLines() {
+    const lines = [];
+    const time = getRegistrationTimestamp(mrRegistration);
+    const user = getRegistrationUser(mrRegistration);
+    if (time && user) lines.push(`REG generated ${time} by ${user}`);
+    else if (time) lines.push(`REG generated ${time}`);
+    else if (user) lines.push(`REG author: ${user}`);
+    if (mrManualAdjusted || hasManualAdjustment()) {
+        lines.push('Manual registration offsets applied');
+        lines.push(`Manual Δ ${formatManualAdjustmentSummary()}`);
+    } else {
+        const rotMag = Math.max(Math.abs(mrRefinementRotVec.x || 0), Math.abs(mrRefinementRotVec.y || 0), Math.abs(mrRefinementRotVec.z || 0));
+        const hasRefineDelta = mrRefinementDelta && (Math.abs(mrRefinementDelta.x) > 1e-3 || Math.abs(mrRefinementDelta.y) > 1e-3 || Math.abs(mrRefinementDelta.z) > 1e-3 || rotMag > 0.05);
+        if (mrRefinementAccepted && hasRefineDelta) {
+            lines.push('Registration refined based on VOI (box)');
+        }
+    }
+    return lines;
+}
+
 async function resampleMRToCT() {
     if (!ctFiles || !ctFiles.length) {
         showMessage('error', 'Load CT before MR padding.');
@@ -1367,49 +2350,15 @@ async function resampleMRToCT() {
     // Choose registration and direction to map MR -> CT
     const ctFor = currentCTSeries?.forUID;
     const mrFor = currentMRSeries?.forUID;
-    const composeFromTransforms = (reg) => {
-        if (!reg || !reg.transforms || !ctFor || !mrFor) return null;
-        const ctXform = reg.transforms.find(t => t.forUID === ctFor);
-        const mrXform = reg.transforms.find(t => t.forUID === mrFor);
-        if (!ctXform || !ctXform.matrix || !mrXform || !mrXform.matrix) return null;
-        const invCt = invertMatrix4(ctXform.matrix);
-        if (!invCt) return null;
-        return multiplyMatrix4(invCt, mrXform.matrix); // MR->CT = inv(CT->reg) * (MR->reg)
-    };
-    const chooseRegistration = () => {
-        const candidates = mrRegistrations || [];
-        for (const reg of candidates) {
-            const hasTransforms = reg.transforms && reg.transforms.length >= 2;
-            if ((!reg.matrix && !hasTransforms) || !reg.forList || reg.forList.length < 2) continue;
-            const fromFOR = reg.forList[0];
-            const toFOR = reg.forList[1];
-            if (fromFOR === mrFor && toFOR === ctFor) {
-                const composed = composeFromTransforms(reg);
-                return { reg, matrix: composed || reg.matrix, inverted: false };
-            }
-            if (fromFOR === ctFor && toFOR === mrFor) {
-                const inv = invertMatrix4(reg.matrix);
-                const composed = composeFromTransforms(reg);
-                if (composed) return { reg, matrix: composed, inverted: false };
-                if (inv) return { reg, matrix: inv, inverted: true };
-            }
-            const composed = composeFromTransforms(reg);
-            if (composed) return { reg, matrix: composed, inverted: false };
-        }
-        // fallback: first with usable data
-        const any = candidates.find(r => r.matrix || (r.transforms && r.transforms.length >= 2));
-        if (any) {
-            const composed = composeFromTransforms(any);
-            return { reg: any, matrix: composed || any.matrix, inverted: false };
-        }
-        return null;
-    };
-    const sel = chooseRegistration();
-    if (sel) {
-        mrRegistration = sel.reg;
-        mrToCtMatrix = sel.matrix;
-    } else if (mrRegistration) {
-        mrToCtMatrix = mrToCtMatrix || composeFromTransforms(mrRegistration) || mrRegistration.matrix;
+    const selection = chooseRegistrationForCurrentPair();
+    const hasRefine = mrRefinementDelta && (Math.abs(mrRefinementDelta.x) > 1e-3 || Math.abs(mrRefinementDelta.y) > 1e-3 || Math.abs(mrRefinementDelta.z) > 1e-3 || Math.abs(mrRefinementRotDeg) > 0.05);
+    if (selection?.matrix && !hasRefine) {
+        mrRegistration = selection.reg || mrRegistration;
+        mrToCtMatrix = selection.matrix;
+        mrRefineBaselineMatrix = selection.matrix ? [...selection.matrix] : mrRefineBaselineMatrix;
+    } else if (!mrToCtMatrix && mrRegistration) {
+        mrToCtMatrix = composeRegistrationTransforms(mrRegistration) || mrRegistration.matrix;
+        if (mrToCtMatrix && !mrRefineBaselineMatrix) mrRefineBaselineMatrix = [...mrToCtMatrix];
     }
 
     if (!mrToCtMatrix) {
@@ -1417,7 +2366,7 @@ async function resampleMRToCT() {
         updateMrStatusText('Registration missing.');
         return null;
     }
-    const regFor = mrRegistration?.forList || [];
+    const regFor = (selection?.reg || mrRegistration)?.forList || [];
     if (regFor.length && (ctFor || mrFor) && (!(ctFor && regFor.includes(ctFor)) || !(mrFor && regFor.includes(mrFor)))) {
         showMessage('info', 'REG FORs do not match CT/MR FORs; proceeding with provided matrix.');
     }
@@ -1429,6 +2378,7 @@ async function resampleMRToCT() {
         updateMrStatusText('CT geometry unavailable.');
         return null;
     }
+    const ctVolume = ctGeom;
     mrVolume = mrVolume || buildVolumeFromSlices(mrSeries, 'MR');
     if (!mrVolume) {
         showMessage('error', 'Unable to build MR volume.');
@@ -1447,8 +2397,14 @@ async function resampleMRToCT() {
     const ctSpan = Math.max(1e-3, ctMax - ctMin);
     const mrSpan = Math.max(1e-3, mrMax - mrMin);
 
-    const regMatrix = mrToCtMatrix || composeFromTransforms(mrRegistration) || mrRegistration.matrix;
-    const mrToCt = (config.matrixDir === 'mrct') ? regMatrix : invertMatrix4(regMatrix);
+    const regMatrix = mrToCtMatrix || composeRegistrationTransforms(mrRegistration) || mrRegistration?.matrix;
+    const baseMrToCt = (config.matrixDir === 'mrct') ? regMatrix : invertMatrix4(regMatrix);
+    if (!baseMrToCt) {
+        showMessage('error', 'Registration matrix is not invertible.');
+        updateMrStatusText('Registration matrix invalid.');
+        return null;
+    }
+    const mrToCt = applyManualAdjustmentsToMatrix(baseMrToCt, mrManualOffset, mrManualRotationRad, ctGeom);
     const ctToMr = invertMatrix4(mrToCt);
     if (!ctToMr) {
         showMessage('error', 'Registration matrix is not invertible.');
@@ -1510,19 +2466,6 @@ async function resampleMRToCT() {
             }
         }
 
-        // Stamp warnings and provenance directly into the MR-padded preview/export
-        const annotationLines = ['NOT FOR DOSE CALCULATION'];
-        const ctName = ctSeriesMap?.[currentCTSeries?.seriesUID || '']?.desc || currentCTSeries?.seriesUID || 'CT';
-        const mrName = mrSeriesMap?.[currentMRSeries?.seriesUID || '']?.desc || currentMRSeries?.seriesUID || 'MR';
-        annotationLines.push(`CT: ${ctName}`);
-        annotationLines.push(`MR: ${mrName}`);
-        annotationLines.forEach((line, idx) => {
-            const margin = FOOTER_MARGIN + idx * (FOOTER_FONT_PX + 4);
-            stampTopLeftWarning(outHU, width, height, line, margin);
-        });
-        // Place clinical warning at bottom
-        stampTopLeftWarning(outHU, width, height, 'NOT FOR CLINICAL USE', null, true);
-
         const modifiedPixelData = new Int16Array(outHU.length);
         for (let i = 0; i < outHU.length; i++) {
             modifiedPixelData[i] = Math.max(-32768, Math.min(32767, Math.round((outHU[i] - intercept) / slope)));
@@ -1532,7 +2475,55 @@ async function resampleMRToCT() {
         updateMRProgress(((sliceIdx + 1) / depth) * 100, `Slice ${sliceIdx + 1}/${depth}`);
     }
 
-    updateMrStatusText('MR padding ready.');
+    const refineApplied = (mrRefinementAccepted && mrRefinementDelta && (Math.abs(mrRefinementDelta.x) > 1e-3 || Math.abs(mrRefinementDelta.y) > 1e-3 || Math.abs(mrRefinementDelta.z) > 1e-3 || Math.abs(mrRefinementRotDeg) > 0.05));
+    // Stamp warnings and provenance directly into the MR-padded preview/export
+    const annotationLines = ['NOT FOR DOSE CALCULATION'];
+    const ctName = ctSeriesMap?.[currentCTSeries?.seriesUID || '']?.desc || currentCTSeries?.seriesUID || 'CT';
+    const mrName = mrSeriesMap?.[currentMRSeries?.seriesUID || '']?.desc || currentMRSeries?.seriesUID || 'MR';
+    const otherLines = [];
+    otherLines.push(`CT: ${ctName}`);
+    otherLines.push(`MR: ${mrName}`);
+    buildRegistrationAnnotationLines().forEach(line => otherLines.push(line));
+    resampled.forEach((slice, idx) => {
+        const huTarget = slice?.huData;
+        if (!huTarget) return;
+        otherLines.forEach((line, lineIdx) => {
+            const margin = FOOTER_MARGIN + lineIdx * (FOOTER_FONT_PX + 4);
+            stampTopLeftWarning(huTarget, width, height, line, margin, false, false);
+        });
+        // Place dose warning bottom-right and clinical warning bottom-left
+        stampTopLeftWarning(huTarget, width, height, 'NOT FOR DOSE CALCULATION', null, true, true);
+        stampTopLeftWarning(huTarget, width, height, 'NOT FOR CLINICAL USE', null, true, false);
+        // Burn refinement VOI outline if applied (or accepted), after all other text
+        const roiToBurn = mrRefinementAccepted ? (mrAcceptedRoiBox || roiRefineBox) : null;
+        if (roiToBurn) {
+            // Draw on slices intersecting the ROI
+            if (idx >= roiToBurn.minZ && idx <= roiToBurn.maxZ) {
+                burnRoiOutline(huTarget, width, height, roiToBurn, ctVolume, {
+                    hu: 1800,
+                    thickness: 3,
+                    sliceIndex: idx,
+                    dashed: false,
+                    alpha: 0.5,
+                    boostWindowFrac: 1.0,
+                    fillZFaces: true
+                });
+            }
+        }
+        // Keep DICOM pixel data in sync with burned annotations
+        const slopeVal = Math.abs(slope) > 1e-6 ? slope : 1;
+        const interceptVal = intercept || 0;
+        const updatedPixels = new Int16Array(huTarget.length);
+        for (let i = 0; i < huTarget.length; i++) {
+            const raw = Math.round((huTarget[i] - interceptVal) / slopeVal);
+            updatedPixels[i] = Math.max(-32768, Math.min(32767, raw));
+        }
+        slice.modifiedPixelData = updatedPixels;
+    });
+    const fmt = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} mm`;
+    const rotNote = Math.abs(mrRefinementRotDeg) > 0.05 ? `, rot x/y/z ${mrRefinementRotVec.x.toFixed(2)}, ${mrRefinementRotVec.y.toFixed(2)}, ${mrRefinementRotVec.z.toFixed(2)}°` : '';
+    const refineNote = refineApplied ? ` VOI Δ ${fmt(mrRefinementDelta.x)}, ${fmt(mrRefinementDelta.y)}, ${fmt(mrRefinementDelta.z)}${rotNote}` : '';
+    updateMrStatusText(`MR padding ready.${refineNote}`);
     updateMRProgress(0, '');
     refreshMrStatusUI();
     return resampled;
@@ -1543,6 +2534,17 @@ async function buildMRPreview(showToast = true) {
     if (!resampled || !resampled.length) return false;
     mrResampledSlices = resampled;
     mrBlendedSlices = rebuildMrBlend();
+    if (!window.simpleViewerData) {
+        const ww = Math.max(1, (ctWindowRange?.max || 240) - (ctWindowRange?.min || -160));
+        const wl = ((ctWindowRange?.max || 240) + (ctWindowRange?.min || -160)) / 2;
+        window.simpleViewerData = {
+            currentSlice: 0,
+            isShowingBurned: false,
+            windowWidth: ww,
+            windowLevel: wl
+        };
+    }
+    window.simpleViewerData.currentSlice = Math.min(window.simpleViewerData.currentSlice || 0, resampled.length - 1);
     mrPreviewActive = true;
     const btn = document.getElementById('mrPreviewBtn');
     if (btn) btn.textContent = 'Preview Off';
@@ -1554,6 +2556,10 @@ async function buildMRPreview(showToast = true) {
 }
 
 async function toggleMRPreview() {
+    if (mrManualRegMode) {
+        showMessage('info', 'Finish or cancel manual registration before toggling preview.');
+        return;
+    }
     if (mrPreviewActive) {
         mrPreviewActive = false;
         mrResampledSlices = [];
@@ -1592,6 +2598,310 @@ async function exportMRPadded() {
     updateMrStatusText('Export complete.');
 }
 
+async function refineRegistrationInROI() {
+    let refineIter = 0;
+    let overlayShown = false;
+    let iterSinceYield = 0;
+    const MAX_TRANS_MM = 10; // ±1 cm constraint
+    const MAX_ROT_DEG = 5;   // ±5° constraint
+    const finishOverlay = () => {
+        if (overlayShown) hideRefineOverlay();
+        overlayShown = false;
+    };
+    const maybeYield = async () => {
+        iterSinceYield += 1;
+        if (iterSinceYield >= 8) {
+            iterSinceYield = 0;
+            await nextFrame();
+        }
+    };
+    if (activeTab !== 'mr') switchTab('mr');
+    if (!ctFiles?.length || !mrSeries?.length) {
+        showMessage('error', 'Load CT and MR first.');
+        return;
+    }
+    if (!mrRefineBaselineMatrix) {
+        const sel = chooseRegistrationForCurrentPair();
+        mrRefineBaselineMatrix = sel?.matrix ? [...sel.matrix] : (mrToCtMatrix ? [...mrToCtMatrix] : null);
+    }
+    const baseSel = chooseRegistrationForCurrentPair();
+    const baseMatrix = mrToCtMatrix || baseSel?.matrix || composeRegistrationTransforms(mrRegistration);
+    if (!baseMatrix) {
+        showMessage('error', 'Registration DICOM required before refinement.');
+        return;
+    }
+    const matrixDir = document.querySelector('input[name=\"mrMatrixDir\"]:checked')?.value || 'mrct';
+    const mrToCtBase = (matrixDir === 'mrct') ? baseMatrix : invertMatrix4(baseMatrix);
+    if (!mrToCtBase) {
+        showMessage('error', 'Registration matrix invalid or not invertible.');
+        return;
+    }
+
+    const ctVolume = buildVolumeFromSlices(ctFiles, 'CT');
+    if (!ctVolume) {
+        showMessage('error', 'Unable to build CT volume for refinement.');
+        return;
+    }
+    mrVolume = mrVolume || buildVolumeFromSlices(mrSeries, 'MR');
+    if (!mrVolume) {
+        showMessage('error', 'Unable to build MR volume for refinement.');
+        return;
+    }
+    if (!roiOverlapInitDone && mrVolume) {
+        const initialBox = computeInitialRoiBox(ctVolume, mrVolume, mrToCtBase);
+        if (initialBox) {
+            roiRefineBox = initialBox;
+            if (!isFullCtBox(initialBox, ctVolume)) roiOverlapInitDone = true;
+        }
+        updateRoiRefinementOptions();
+    }
+    const roiBox = clampRoiBox(roiRefineBox || computeInitialRoiBox(ctVolume, mrVolume, mrToCtBase) || initRoiRefineBoxFromVolume(ctVolume, true), ctVolume);
+    if (!roiBox) {
+        showMessage('error', 'Define the VOI box before refinement.');
+        return;
+    }
+
+    // Intensity ranges for MI binning (fallback to window range if available)
+    const statusEl = document.getElementById('mrRefineStatus');
+    const plotCanvas = document.getElementById('mrRefineCostPlot');
+    const resultLabel = document.getElementById('mrRefineResultLabel');
+    mrRefineCostHistory = [];
+    if (plotCanvas) { const ctx = plotCanvas.getContext('2d'); if (ctx) ctx.clearRect(0,0,plotCanvas.width,plotCanvas.height); }
+    plotRefineCost(true);
+    if (resultLabel) { resultLabel.style.display = 'none'; }
+    if (statusEl) statusEl.textContent = 'Running VOI refinement...';
+    showRefineOverlay('Calculating new alignment…');
+    overlayShown = true;
+    await nextFrame(); // let overlay render before heavy work
+    // Intensity ranges for MI binning (fallback to window range if available)
+    const ctRange = ctWindowRange || { min: -1024, max: 3071 };
+    const mrRange = mrDefaultWindowRange || mrWindowRange || { min: -2000, max: 800 };
+    const ctMin = ctRange.min ?? -1024;
+    const ctMax = ctRange.max ?? 3071;
+    const mrMin = mrRange.min ?? -2000;
+    const mrMax = mrRange.max ?? 800;
+    const ctSpan = Math.max(1e-3, ctMax - ctMin);
+    const mrSpan = Math.max(1e-3, mrMax - mrMin);
+
+    updateMrStatusText('Refining registration in VOI box...');
+    const searchOffsets = [-10, -5, 0, 5, 10]; // up to 1 cm
+    const rotOffsets = [-5, -2.5, 0, 2.5, 5]; // up to 5 degrees (per axis)
+    const rowVec = ctVolume.colCos.map(v => v * (ctVolume.rowSpacing || 1));
+    const colVec = ctVolume.rowCos.map(v => v * (ctVolume.colSpacing || 1));
+    const normVec = ctVolume.normal.map(v => v * (ctVolume.sliceSpacing || 1));
+    const positions = ctVolume.positions || [];
+    const { width, height, depth } = ctVolume;
+    const bbox = { ...roiBox };
+    if (isFullCtBox(bbox, ctVolume)) {
+        showMessage('error', 'Set a smaller VOI box; current VOI spans the whole CT.');
+        updateMrStatusText('VOI refinement needs a smaller box.');
+        finishOverlay();
+        return;
+    }
+    const voxelsInBox = (bbox.maxX - bbox.minX + 1) * (bbox.maxY - bbox.minY + 1) * (bbox.maxZ - bbox.minZ + 1);
+    const baseStride = Math.max(1, Math.floor(voxelsInBox / 80000)); // denser sampling to honor ROI
+    const interpolation = document.getElementById('mrInterpolation')?.value || 'linear';
+
+    const clampTrans = (v) => Math.max(-MAX_TRANS_MM, Math.min(MAX_TRANS_MM, v));
+    const clampRot = (v) => Math.max(-MAX_ROT_DEG, Math.min(MAX_ROT_DEG, v));
+
+    function scoreDelta(dx, dy, dz, rotDeg, strideMultiplier = 1, rotAxis = null, rotVec = null) {
+        const stride = Math.max(1, Math.floor(baseStride * strideMultiplier));
+        const rotVectorRaw = rotVec || (rotAxis ? {
+            x: rotAxis[0] ? rotDeg : 0,
+            y: rotAxis[1] ? rotDeg : 0,
+            z: rotAxis[2] ? rotDeg : 0
+        } : { x: rotDeg, y: rotDeg, z: rotDeg });
+        const rotVector = {
+            x: clampRot(rotVectorRaw.x || 0),
+            y: clampRot(rotVectorRaw.y || 0),
+            z: clampRot(rotVectorRaw.z || 0)
+        };
+        const mrToCt = applyDeltaRigid(mrToCtBase, {
+            x: clampTrans(dx),
+            y: clampTrans(dy),
+            z: clampTrans(dz),
+            rotVec: rotVector
+        }, ctVolume);
+        const ctToMr = invertMatrix4(mrToCt);
+        if (!ctToMr) return -Infinity;
+        let count = 0;
+        let sumCt = 0, sumMr = 0, sumCt2 = 0, sumMr2 = 0, sumCross = 0;
+        const bins = 48;
+        const joint = new Float64Array(bins * bins);
+        const histCt = new Float64Array(bins);
+        const histMr = new Float64Array(bins);
+        let idxCounter = 0;
+        for (let z = Math.max(0, bbox.minZ); z <= Math.min(depth - 1, bbox.maxZ); z++) {
+            const pos = positions[z] || positions[0] || [0, 0, 0];
+            for (let y = Math.max(0, bbox.minY); y <= Math.min(height - 1, bbox.maxY); y++) {
+                for (let x = Math.max(0, bbox.minX); x <= Math.min(width - 1, bbox.maxX); x++) {
+                    if (stride > 1 && (idxCounter++ % stride !== 0)) continue;
+                    const world = [
+                        pos[0] + colVec[0] * x + rowVec[0] * y,
+                        pos[1] + colVec[1] * x + rowVec[1] * y,
+                        pos[2] + colVec[2] * x + rowVec[2] * y
+                    ];
+                    const mrWorld = applyMatrix4(ctToMr, world);
+                    const vox = worldToVoxel(mrVolume, mrWorld);
+                    if (!vox) continue;
+                    const mrVal = sampleVolume(mrVolume, vox.i, vox.j, vox.k, interpolation);
+                    if (mrVal === null || mrVal === undefined) continue;
+                    const ctVal = ctVolume.scalars ? ctVolume.scalars[z * width * height + y * width + x] : null;
+                    if (ctVal === null || ctVal === undefined) continue;
+                    count++;
+                    sumCt += ctVal; sumMr += mrVal;
+                    sumCt2 += ctVal * ctVal; sumMr2 += mrVal * mrVal;
+                    sumCross += ctVal * mrVal;
+                    // MI bins (window-based clamp)
+                    const ctBin = Math.max(0, Math.min(bins - 1, Math.floor(((ctVal - ctMin) / ctSpan) * bins)));
+                    const mrBin = Math.max(0, Math.min(bins - 1, Math.floor(((mrVal - mrMin) / mrSpan) * bins)));
+                    joint[mrBin * bins + ctBin] += 1;
+                    histCt[ctBin] += 1;
+                    histMr[mrBin] += 1;
+                }
+            }
+        }
+        if (count < 50) return -Infinity;
+        const meanCt = sumCt / count;
+        const meanMr = sumMr / count;
+        const cov = (sumCross / count) - (meanCt * meanMr);
+        const varCt = (sumCt2 / count) - (meanCt * meanCt);
+        const varMr = (sumMr2 / count) - (meanMr * meanMr);
+        if (varCt <= 0 || varMr <= 0) return -Infinity;
+        const ncc = cov / Math.sqrt(varCt * varMr);
+        // Mutual information
+        const total = histCt.reduce((a, b) => a + b, 0) || 1;
+        let mi = 0;
+        for (let i = 0; i < bins; i++) {
+            const pCt = histCt[i] / total;
+            if (pCt <= 0) continue;
+            for (let j = 0; j < bins; j++) {
+                const pMr = histMr[j] / total;
+                const pJoint = joint[j * bins + i] / total;
+                if (pJoint <= 0 || pMr <= 0) continue;
+                mi += pJoint * Math.log(pJoint / (pCt * pMr));
+            }
+        }
+        // Weight MI heavily, add small NCC to favor intensity correlation
+        return mi + 0.05 * ncc;
+    }
+
+    let best = { x: 0, y: 0, z: 0, rot: 0, score: -Infinity };
+    let iterSincePlot = 0;
+    const recordCost = (val) => {
+        refineIter += 1;
+        if (Number.isFinite(val)) mrRefineCostHistory.push(val);
+        const displayScore = Number.isFinite(best.score) ? best.score : (Number.isFinite(val) ? val : null);
+        updateRefineOverlay(displayScore, refineIter);
+        iterSincePlot += 1;
+        if (iterSincePlot % 4 === 0) plotRefineCost();
+        // Yield periodically to keep UI responsive
+        void maybeYield();
+    };
+    const pitchAxes = [[1, 0, 0]];
+    const rollAxes = [[0, 1, 0]];
+    const yawAxes = [[0, 0, 1]];
+    const rotAxes = [...pitchAxes, ...rollAxes, ...yawAxes];
+    const dzOffsets = [-6, -3, 0, 3, 6];
+
+    for (const dx of searchOffsets) {
+        for (const dy of searchOffsets) {
+            for (const dz of dzOffsets) {
+                for (const rotAxis of rotAxes) {
+                    for (const rot of rotOffsets) {
+                        const rotVec = { x: 0, y: 0, z: 0 };
+                        if (rotAxis === pitchAxes[0]) rotVec.x = rot;
+                        else if (rotAxis === rollAxes[0]) rotVec.y = rot;
+                        else if (rotAxis === yawAxes[0]) rotVec.z = rot;
+                        const s = scoreDelta(dx, dy, dz, rot, 1.5, rotAxis, rotVec); // coarse stride for coarse search
+                        if (s > best.score) best = { x: clampTrans(dx), y: clampTrans(dy), z: clampTrans(dz), rot, rotAxis, rotVec, score: s };
+                        recordCost(best.score);
+                        await maybeYield();
+                    }
+                }
+            }
+        }
+    }
+    plotRefineCost();
+
+    if (!Number.isFinite(best.score) || best.score === -Infinity) {
+        showMessage('error', 'Unable to refine registration for this VOI box.');
+        updateMrStatusText('VOI refinement failed.');
+        finishOverlay();
+        return;
+    }
+
+    // Multi-resolution hill climb on MI (start ~2mm, end 0.5mm)
+    const stepLevels = [2, 1, 0.5, 0.2]; // finer translation down to 0.2 mm
+    for (const step of stepLevels) {
+        let improved = true;
+        let iter = 0;
+        while (improved && iter < 40) {
+            improved = false;
+            iter++;
+            const rotStep = Math.max(0.5, step);
+            const rotVec = {
+                x: clampRot((best.rotVec?.x) || 0),
+                y: clampRot((best.rotVec?.y) || 0),
+                z: clampRot((best.rotVec?.z) || 0)
+            };
+    const candidates = [
+        { x: best.x, y: best.y, z: best.z, rotVec: { ...rotVec } },
+        { x: clampTrans(best.x + step), y: best.y, z: best.z, rotVec: { ...rotVec } },
+                { x: clampTrans(best.x - step), y: best.y, z: best.z, rotVec: { ...rotVec } },
+                { x: best.x, y: clampTrans(best.y + step), z: best.z, rotVec: { ...rotVec } },
+                { x: best.x, y: clampTrans(best.y - step), z: best.z, rotVec: { ...rotVec } },
+                { x: best.x, y: best.y, z: clampTrans(best.z + Math.max(0.5, step / 2)), rotVec: { ...rotVec } },
+                { x: best.x, y: best.y, z: clampTrans(best.z - Math.max(0.5, step / 2)), rotVec: { ...rotVec } },
+                { x: clampTrans(best.x + step), y: clampTrans(best.y + step), z: best.z, rotVec: { ...rotVec } },
+                { x: clampTrans(best.x - step), y: clampTrans(best.y - step), z: best.z, rotVec: { ...rotVec } },
+        { x: best.x, y: best.y, z: best.z, rotVec: { ...rotVec, x: clampRot(rotVec.x + Math.max(0.1, rotStep)) } },
+        { x: best.x, y: best.y, z: best.z, rotVec: { ...rotVec, x: clampRot(rotVec.x - Math.max(0.1, rotStep)) } },
+        { x: best.x, y: best.y, z: best.z, rotVec: { ...rotVec, y: clampRot(rotVec.y + Math.max(0.1, rotStep)) } },
+        { x: best.x, y: best.y, z: best.z, rotVec: { ...rotVec, y: clampRot(rotVec.y - Math.max(0.1, rotStep)) } },
+        { x: best.x, y: best.y, z: best.z, rotVec: { ...rotVec, z: clampRot(rotVec.z + Math.max(0.1, rotStep)) } },
+        { x: best.x, y: best.y, z: best.z, rotVec: { ...rotVec, z: clampRot(rotVec.z - Math.max(0.1, rotStep)) } }
+            ];
+            for (const cand of candidates) {
+                const s = scoreDelta(cand.x, cand.y, cand.z, 0, step >= 2 ? 1.3 : 1, null, cand.rotVec);
+                if (s > best.score + 1e-4) {
+                    best = { ...cand, score: s };
+                    improved = true;
+                }
+                recordCost(best.score);
+                await maybeYield();
+            }
+            plotRefineCost();
+        }
+    }
+
+    mrToCtMatrix = applyDeltaRigid(mrToCtBase, { x: clampTrans(best.x), y: clampTrans(best.y), z: clampTrans(best.z), rotVec: { x: clampRot(best.rotVec?.x || 0), y: clampRot(best.rotVec?.y || 0), z: clampRot(best.rotVec?.z || 0) } }, ctVolume);
+    mrRefinementDelta = { x: best.x, y: best.y, z: best.z };
+    mrRefinementRotVec = best.rotVec || { x: 0, y: 0, z: 0 };
+    mrRefinementRotDeg = Math.max(Math.abs(mrRefinementRotVec.x), Math.abs(mrRefinementRotVec.y), Math.abs(mrRefinementRotVec.z));
+    mrRefinementAccepted = false;
+    mrRegistration = baseSel?.reg || mrRegistration;
+    mrPreviewActive = false;
+    mrResampledSlices = [];
+    mrBlendedSlices = [];
+    window.volumeData = null;
+    roiBoxEditMode = true;
+    roiBoxDrag = null;
+    updateRoiRefinementOptions();
+    const fmtVal = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} mm`;
+    showMessage('success', `Registration refined in VOI box (Δ ${fmtVal(best.x)}, ${fmtVal(best.y)}, ${fmtVal(best.z)}, rot ${(best.rot||0).toFixed(2)}°).`);
+    updateMrStatusText('Registration refined; rebuilding preview...');
+    if (resultLabel) {
+        resultLabel.style.display = 'block';
+        resultLabel.textContent = `Δ mm: ${best.x.toFixed(1)}, ${best.y.toFixed(1)}, ${best.z.toFixed(1)} | Δ° (x/y/z): ${mrRefinementRotVec.x.toFixed(2)}, ${mrRefinementRotVec.y.toFixed(2)}, ${mrRefinementRotVec.z.toFixed(2)}`;
+    }
+    if (statusEl) statusEl.textContent = 'Refinement complete.';
+    await buildMRPreview(false);
+    refreshMrStatusUI();
+    finishOverlay();
+}
+
 // Vector / matrix helpers
 function dot3(a, b) { return (a[0] * b[0]) + (a[1] * b[1]) + (a[2] * b[2]); }
 function cross3(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
@@ -1620,6 +2930,98 @@ function multiplyMatrix4(a, b) {
                 a[row * 4 + 2] * b[2 * 4 + col] +
                 a[row * 4 + 3] * b[3 * 4 + col];
         }
+    }
+    return out;
+}
+function applyManualOffsetToMatrix(mat, offset = mrManualOffset) {
+    return applyManualAdjustmentsToMatrix(mat, offset, mrManualRotationRad);
+}
+function rotationAroundAxisMatrix(axis, angleRad) {
+    const [x, y, z] = normalizeVec3(axis || [0, 0, 1]);
+    const c = Math.cos(angleRad);
+    const s = Math.sin(angleRad);
+    const t = 1 - c;
+    return [
+        t * x * x + c,     t * x * y - s * z, t * x * z + s * y, 0,
+        t * x * y + s * z, t * y * y + c,     t * y * z - s * x, 0,
+        t * x * z - s * y, t * y * z + s * x, t * z * z + c,     0,
+        0, 0, 0, 1
+    ];
+}
+function getMrVolumeCenterWorld() {
+    const vol = mrVolume;
+    if (!vol || !vol.origin || !vol.rowCos || !vol.colCos || !vol.normal) return [0, 0, 0];
+    const ox = vol.origin[0], oy = vol.origin[1], oz = vol.origin[2];
+    const cx = (vol.colSpacing || vol.rowSpacing || 1) * ((vol.width || 1) - 1) / 2;
+    const cy = (vol.rowSpacing || vol.colSpacing || 1) * ((vol.height || 1) - 1) / 2;
+    const cz = (vol.sliceSpacing || 1) * ((vol.depth || 1) - 1) / 2;
+    return [
+        ox + vol.colCos[0] * cx + vol.rowCos[0] * cy + vol.normal[0] * cz,
+        oy + vol.colCos[1] * cx + vol.rowCos[1] * cy + vol.normal[1] * cz,
+        oz + vol.colCos[2] * cx + vol.rowCos[2] * cy + vol.normal[2] * cz
+    ];
+}
+function applyManualAdjustmentsToMatrix(mat, offset = mrManualOffset, rotationRad = mrManualRotationRad, geom = null) {
+    if (!mat || mat.length !== 16) return mat;
+    const dx = offset?.x || 0;
+    const dy = offset?.y || 0;
+    const dz = offset?.z || 0;
+    const hasRot = Number.isFinite(rotationRad) && Math.abs(rotationRad) > 1e-6;
+    const axis = geom?.normal || (mrManualGeom?.normal) || [0, 0, 1];
+    const anchor = getMrVolumeCenterWorld();
+    let out = mat.slice();
+    if (hasRot) {
+        const rot = rotationAroundAxisMatrix(axis, rotationRad);
+        const tNeg = translationMatrix(-(anchor?.[0] || 0), -(anchor?.[1] || 0), -(anchor?.[2] || 0));
+        const tPos = translationMatrix(anchor?.[0] || 0, anchor?.[1] || 0, anchor?.[2] || 0);
+        const rotAboutAnchor = multiplyMatrix4(tPos, multiplyMatrix4(rot, tNeg));
+        const composed = multiplyMatrix4(out, rotAboutAnchor);
+        if (composed) out = composed;
+    }
+    if (dx || dy || dz) {
+        out[3] += dx;
+        out[7] += dy;
+        out[11] += dz;
+    }
+    return out;
+}
+
+function applyDeltaTranslation(mat, delta = { x: 0, y: 0, z: 0 }) {
+    if (!mat || mat.length !== 16) return mat;
+    const dx = delta?.x || 0;
+    const dy = delta?.y || 0;
+    const dz = delta?.z || 0;
+    if (!dx && !dy && !dz) return mat;
+    const out = mat.slice();
+    out[3] += dx;
+    out[7] += dy;
+    out[11] += dz;
+    return out;
+}
+function getCtVolumeCenterWorld(vol) {
+    if (!vol || !vol.origin) return [0, 0, 0];
+    const cx = ((vol.width || 1) - 1) * (vol.colSpacing || vol.rowSpacing || 1) / 2;
+    const cy = ((vol.height || 1) - 1) * (vol.rowSpacing || vol.colSpacing || 1) / 2;
+    const cz = ((vol.depth || 1) - 1) * (vol.sliceSpacing || 1) / 2;
+    return [
+        vol.origin[0] + vol.colCos[0] * cx + vol.rowCos[0] * cy + vol.normal[0] * cz,
+        vol.origin[1] + vol.colCos[1] * cx + vol.rowCos[1] * cy + vol.normal[1] * cz,
+        vol.origin[2] + vol.colCos[2] * cx + vol.rowCos[2] * cy + vol.normal[2] * cz
+    ];
+}
+function applyDeltaRigid(mat, delta = { x: 0, y: 0, z: 0, rotDeg: 0, rotAxis: null }, vol = null, normal = null) {
+    if (!mat || mat.length !== 16) return mat;
+    const rotRad = (delta.rotDeg || 0) * Math.PI / 180;
+    let out = applyDeltaTranslation(mat, delta);
+    if (Math.abs(rotRad) > 1e-6) {
+        const axis = delta.rotAxis || normal || vol?.normal || [0, 0, 1];
+        const anchor = getCtVolumeCenterWorld(vol);
+        const rot = rotationAroundAxisMatrix(axis, rotRad);
+        const tNeg = translationMatrix(-(anchor?.[0] || 0), -(anchor?.[1] || 0), -(anchor?.[2] || 0));
+        const tPos = translationMatrix(anchor?.[0] || 0, anchor?.[1] || 0, anchor?.[2] || 0);
+        const rotAboutAnchor = multiplyMatrix4(tPos, multiplyMatrix4(rot, tNeg));
+        const composed = multiplyMatrix4(out, rotAboutAnchor);
+        if (composed) out = composed;
     }
     return out;
 }
@@ -1762,6 +3164,470 @@ function extractROIData() {
     
     // Display ROIs in the sidebar visibility controls
     populateROIVisibilityList();
+    updateRoiRefinementOptions();
+}
+
+function clampRoiBox(box, volume) {
+    if (!box || !volume) return null;
+    const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+    const out = { ...box };
+    out.minX = clamp(Math.floor(out.minX), 0, volume.width - 1);
+    out.maxX = clamp(Math.floor(out.maxX), 0, volume.width - 1);
+    out.minY = clamp(Math.floor(out.minY), 0, volume.height - 1);
+    out.maxY = clamp(Math.floor(out.maxY), 0, volume.height - 1);
+    out.minZ = clamp(Math.floor(out.minZ), 0, volume.depth - 1);
+    out.maxZ = clamp(Math.floor(out.maxZ), 0, volume.depth - 1);
+    out.minX = Math.min(out.minX, out.maxX);
+    out.minY = Math.min(out.minY, out.maxY);
+    out.minZ = Math.min(out.minZ, out.maxZ);
+    return out;
+}
+
+function initRoiRefineBoxFromVolume(volume, returnOnly = false) {
+    if (!volume) return null;
+    const box = {
+        minX: 0,
+        maxX: volume.width - 1,
+        minY: 0,
+        maxY: volume.height - 1,
+        minZ: 0,
+        maxZ: volume.depth - 1
+    };
+    if (!returnOnly) roiRefineBox = box;
+    return box;
+}
+
+function boxVolume(box) {
+    if (!box) return 0;
+    return Math.max(0, (box.maxX - box.minX + 1)) *
+           Math.max(0, (box.maxY - box.minY + 1)) *
+           Math.max(0, (box.maxZ - box.minZ + 1));
+}
+
+function isFullCtBox(box, volume) {
+    if (!box || !volume) return false;
+    const b = clampRoiBox(box, volume);
+    return b.minX === 0 && b.minY === 0 && b.minZ === 0 &&
+        b.maxX === volume.width - 1 && b.maxY === volume.height - 1 && b.maxZ === volume.depth - 1;
+}
+
+function computeOverlapRoiBox(ctVolume, mrVolume, mrToCt) {
+    if (!ctVolume || !mrVolume || !mrToCt) return null;
+    const ctDims = { w: ctVolume.width, h: ctVolume.height, d: ctVolume.depth };
+    const mrRowVec = mrVolume.colCos.map(v => v * (mrVolume.rowSpacing || 1));
+    const mrColVec = mrVolume.rowCos.map(v => v * (mrVolume.colSpacing || 1));
+    const mrNormVec = mrVolume.normal.map(v => v * (mrVolume.sliceSpacing || 1));
+    const corners = [];
+    for (const i of [0, mrVolume.height - 1]) {
+        for (const j of [0, mrVolume.width - 1]) {
+            for (const k of [0, mrVolume.depth - 1]) {
+                const world = [
+                    mrVolume.origin[0] + mrRowVec[0] * i + mrColVec[0] * j + mrNormVec[0] * k,
+                    mrVolume.origin[1] + mrRowVec[1] * i + mrColVec[1] * j + mrNormVec[1] * k,
+                    mrVolume.origin[2] + mrRowVec[2] * i + mrColVec[2] * j + mrNormVec[2] * k
+                ];
+                const ctWorld = applyMatrix4(mrToCt, world);
+                const vox = worldToVoxel(ctVolume, ctWorld);
+                if (vox) corners.push(vox);
+            }
+        }
+    }
+    if (!corners.length) return null;
+    let minI = Infinity, minJ = Infinity, minK = Infinity;
+    let maxI = -Infinity, maxJ = -Infinity, maxK = -Infinity;
+    corners.forEach(({ i, j, k }) => {
+        if (i < minI) minI = i;
+        if (j < minJ) minJ = j;
+        if (k < minK) minK = k;
+        if (i > maxI) maxI = i;
+        if (j > maxJ) maxJ = j;
+        if (k > maxK) maxK = k;
+    });
+    const box = {
+        minX: Math.max(0, Math.floor(minJ)),
+        maxX: Math.min(ctDims.w - 1, Math.ceil(maxJ)),
+        minY: Math.max(0, Math.floor(minI)),
+        maxY: Math.min(ctDims.h - 1, Math.ceil(maxI)),
+        minZ: Math.max(0, Math.floor(minK)),
+        maxZ: Math.min(ctDims.d - 1, Math.ceil(maxK))
+    };
+    if (box.minX > box.maxX || box.minY > box.maxY || box.minZ > box.maxZ) return null;
+    return box;
+}
+
+function computeMrBoxInCt(ctVolume, mrVolume, mrToCt) {
+    if (!ctVolume || !mrVolume || !mrToCt) return null;
+    const mrRowVec = mrVolume.colCos.map(v => v * (mrVolume.rowSpacing || 1));
+    const mrColVec = mrVolume.rowCos.map(v => v * (mrVolume.colSpacing || 1));
+    const mrNormVec = mrVolume.normal.map(v => v * (mrVolume.sliceSpacing || 1));
+    const corners = [];
+    for (const i of [0, mrVolume.height - 1]) {
+        for (const j of [0, mrVolume.width - 1]) {
+            for (const k of [0, mrVolume.depth - 1]) {
+                const world = [
+                    mrVolume.origin[0] + mrRowVec[0] * i + mrColVec[0] * j + mrNormVec[0] * k,
+                    mrVolume.origin[1] + mrRowVec[1] * i + mrColVec[1] * j + mrNormVec[1] * k,
+                    mrVolume.origin[2] + mrRowVec[2] * i + mrColVec[2] * j + mrNormVec[2] * k
+                ];
+                const ctWorld = applyMatrix4(mrToCt, world);
+                const vox = worldToVoxel(ctVolume, ctWorld);
+                if (vox) corners.push(vox);
+            }
+        }
+    }
+    if (!corners.length) return null;
+    let minI = Infinity, minJ = Infinity, minK = Infinity;
+    let maxI = -Infinity, maxJ = -Infinity, maxK = -Infinity;
+    corners.forEach(({ i, j, k }) => {
+        if (i < minI) minI = i;
+        if (j < minJ) minJ = j;
+        if (k < minK) minK = k;
+        if (i > maxI) maxI = i;
+        if (j > maxJ) maxJ = j;
+        if (k > maxK) maxK = k;
+    });
+    return clampRoiBox({
+        minX: minJ,
+        maxX: maxJ,
+        minY: minI,
+        maxY: maxI,
+        minZ: minK,
+        maxZ: maxK
+    }, ctVolume);
+}
+
+function computeInitialRoiBox(ctVolume, mrVolume, mrToCt) {
+    if (!ctVolume) return null;
+    const ctBox = clampRoiBox(initRoiRefineBoxFromVolume(ctVolume, true), ctVolume);
+    if (!mrVolume) return ctBox;
+
+    const candidates = [];
+    const addBox = (box) => { if (box) candidates.push(box); };
+    if (mrToCt) {
+        // Prefer forward matrix; inverse is only a fallback (e.g., mis-labeled direction)
+        addBox(computeMrBoxInCt(ctVolume, mrVolume, mrToCt));
+        const inv = invertMatrix4(mrToCt);
+        if (inv) addBox(computeMrBoxInCt(ctVolume, mrVolume, inv));
+    }
+
+    const buildCenteredFallback = () => {
+        const ctSpacingX = ctVolume.colSpacing || ctVolume.rowSpacing || 1;
+        const ctSpacingY = ctVolume.rowSpacing || ctVolume.colSpacing || 1;
+        const ctSpacingZ = ctVolume.sliceSpacing || 1;
+        const mrSpacingX = mrVolume.colSpacing || mrVolume.rowSpacing || 1;
+        const mrSpacingY = mrVolume.rowSpacing || mrVolume.colSpacing || 1;
+        const mrSpacingZ = mrVolume.sliceSpacing || 1;
+        const minMmX = Math.min(ctVolume.width * ctSpacingX, mrVolume.width * mrSpacingX);
+        const minMmY = Math.min(ctVolume.height * ctSpacingY, mrVolume.height * mrSpacingY);
+        const minMmZ = Math.min(ctVolume.depth * ctSpacingZ, mrVolume.depth * mrSpacingZ);
+        const halfX = (minMmX / 2) / ctSpacingX;
+        const halfY = (minMmY / 2) / ctSpacingY;
+        const halfZ = Math.max(1, (minMmZ / 2) / ctSpacingZ);
+        const cx = (ctVolume.width - 1) / 2;
+        const cy = (ctVolume.height - 1) / 2;
+        const cz = (ctVolume.depth - 1) / 2;
+        return clampRoiBox({
+            minX: cx - halfX,
+            maxX: cx + halfX,
+            minY: cy - halfY,
+            maxY: cy + halfY,
+            minZ: cz - halfZ,
+            maxZ: cz + halfZ
+        }, ctVolume);
+    };
+
+    const poolCandidates = candidates.length ? candidates : [buildCenteredFallback()];
+
+    // Score candidates by distance of their center to the CT center (mm); break ties with larger volume
+    const ctSpacingX = ctVolume.colSpacing || ctVolume.rowSpacing || 1;
+    const ctSpacingY = ctVolume.rowSpacing || ctVolume.colSpacing || 1;
+    const ctSpacingZ = ctVolume.sliceSpacing || 1;
+    const ctCenter = {
+        x: (ctVolume.width - 1) / 2,
+        y: (ctVolume.height - 1) / 2,
+        z: (ctVolume.depth - 1) / 2
+    };
+    let best = null;
+    for (const candidate of poolCandidates) {
+        if (!candidate) continue;
+        const b = clampRoiBox(candidate, ctVolume);
+        const vol = boxVolume(b);
+        if (vol <= 0) continue;
+        const cx = (b.minX + b.maxX) / 2;
+        const cy = (b.minY + b.maxY) / 2;
+        const cz = (b.minZ + b.maxZ) / 2;
+        const dx = (cx - ctCenter.x) * ctSpacingX;
+        const dy = (cy - ctCenter.y) * ctSpacingY;
+        const dz = (cz - ctCenter.z) * ctSpacingZ;
+        const dist2 = dx * dx + dy * dy + dz * dz;
+        const full = isFullCtBox(b, ctVolume);
+        if (!best) { best = { box: b, dist2, vol, full }; continue; }
+        // Prefer non-full over full; then smaller center distance; then larger volume
+        if (best.full && !full) { best = { box: b, dist2, vol, full }; continue; }
+        if (full === best.full) {
+            if (dist2 + 1e-3 < best.dist2) { best = { box: b, dist2, vol, full }; continue; }
+            if (Math.abs(dist2 - best.dist2) <= 1e-3 && vol > best.vol) { best = { box: b, dist2, vol, full }; continue; }
+        }
+    }
+    return best?.box || ctBox;
+}
+
+function ensureRoiRefineBox(ctVolume) {
+    let changed = false;
+    if (!ctVolume) return;
+    if (!mrVolume && mrSeries?.length) mrVolume = buildVolumeFromSlices(mrSeries, 'MR');
+    const matrixDir = document.querySelector('input[name="mrMatrixDir"]:checked')?.value || 'mrct';
+    const sel = chooseRegistrationForCurrentPair();
+    const baseMatrixRaw = mrToCtMatrix || sel?.matrix || composeRegistrationTransforms(mrRegistration);
+    const baseMatrix = baseMatrixRaw ? ((matrixDir === 'mrct') ? baseMatrixRaw : invertMatrix4(baseMatrixRaw)) : null;
+    const initBox = computeInitialRoiBox(ctVolume, mrVolume, baseMatrix);
+    if (initBox) {
+        if (!roiRefineBox || isFullCtBox(roiRefineBox, ctVolume)) {
+            roiRefineBox = initBox;
+            changed = true;
+        }
+        if (!isFullCtBox(initBox, ctVolume)) roiOverlapInitDone = true;
+    }
+    return changed;
+}
+
+function focusToRoiBox(volume, box) {
+    if (!volume || !box) return;
+    const bx = clampRoiBox(box, volume);
+    const midX = Math.round((bx.minX + bx.maxX) / 2);
+    const midY = Math.round((bx.minY + bx.maxY) / 2);
+    const midZ = Math.round((bx.minZ + bx.maxZ) / 2);
+    if (window.simpleViewerData) window.simpleViewerData.currentSlice = clampIndex(midZ, 0, volume.depth - 1);
+    if (viewportState?.sagittal) viewportState.sagittal.currentSliceX = clampIndex(midX, 0, volume.width - 1);
+    if (viewportState?.coronal) viewportState.coronal.currentSliceY = clampIndex(midY, 0, volume.height - 1);
+}
+
+function describeRoiBox(box, volume) {
+    if (!box || !volume) return 'Drag the VOI box in any view to set the VOI.';
+    const b = clampRoiBox(box, volume);
+    const dx = (b.maxX - b.minX + 1) * (volume.colSpacing || 1);
+    const dy = (b.maxY - b.minY + 1) * (volume.rowSpacing || 1);
+    const dz = (b.maxZ - b.minZ + 1) * (volume.sliceSpacing || 1);
+    return `VOI spans ${dx.toFixed(1)} × ${dy.toFixed(1)} × ${dz.toFixed(1)} mm (x/y/z).`;
+}
+
+function updateRoiRefinementOptions() {
+    const row = document.getElementById('mrRoiRefineRow');
+    const refineBtn = document.getElementById('mrRefineRegBtn');
+    const acceptBtn = document.getElementById('mrAcceptRefineBtn');
+    const compareBtn = document.getElementById('mrCompareBtn');
+    const status = document.getElementById('mrRefineStatus');
+    const resultLabel = document.getElementById('mrRefineResultLabel');
+    const label = document.getElementById('mrRoiBoxLabel');
+    const divider = document.getElementById('mrRefineDivider');
+    if (row && activeTab === 'mr') {
+        row.style.display = 'flex';
+        if (divider) divider.style.display = 'block';
+    } else {
+        if (row) row.style.display = 'none';
+        if (divider) divider.style.display = 'none';
+    }
+    const volume = buildCtGeometry();
+    if (!mrVolume && mrSeries?.length) mrVolume = buildVolumeFromSlices(mrSeries, 'MR');
+    const changed = volume ? ensureRoiRefineBox(volume) : false;
+    if (changed && volume && roiRefineBox) focusToRoiBox(volume, roiRefineBox);
+    const box = volume ? clampRoiBox(roiRefineBox, volume) : null;
+    if (refineBtn) refineBtn.disabled = !box;
+    const rotMag = Math.max(Math.abs(mrRefinementRotVec.x || 0), Math.abs(mrRefinementRotVec.y || 0), Math.abs(mrRefinementRotVec.z || 0));
+    if (acceptBtn) acceptBtn.disabled = !(mrRefinementDelta && (Math.abs(mrRefinementDelta.x) > 1e-3 || Math.abs(mrRefinementDelta.y) > 1e-3 || Math.abs(mrRefinementDelta.z) > 1e-3 || rotMag > 0.05));
+    if (compareBtn) {
+        const hasRefine = mrToCtMatrix && mrRefineBaselineMatrix && (mrRefinementDelta && (Math.abs(mrRefinementDelta.x) > 1e-3 || Math.abs(mrRefinementDelta.y) > 1e-3 || Math.abs(mrRefinementDelta.z) > 1e-3 || rotMag > 0.05));
+        compareBtn.disabled = !hasRefine;
+    }
+    if (status) status.textContent = '';
+    if (resultLabel) {
+        const rotMag = Math.max(Math.abs(mrRefinementRotVec.x || 0), Math.abs(mrRefinementRotVec.y || 0), Math.abs(mrRefinementRotVec.z || 0));
+        const hasRes = mrRefinementDelta && (Math.abs(mrRefinementDelta.x) > 1e-3 || Math.abs(mrRefinementDelta.y) > 1e-3 || Math.abs(mrRefinementDelta.z) > 1e-3 || rotMag > 0.05);
+        resultLabel.style.display = hasRes ? 'block' : 'none';
+        if (hasRes) {
+            const fmt = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}`;
+            resultLabel.textContent = `Δ mm: ${fmt(mrRefinementDelta.x)}, ${fmt(mrRefinementDelta.y)}, ${fmt(mrRefinementDelta.z)} | Δ° (x/y/z): ${mrRefinementRotVec.x.toFixed(2)}, ${mrRefinementRotVec.y.toFixed(2)}, ${mrRefinementRotVec.z.toFixed(2)}`;
+        }
+    }
+    plotRefineCost(!mrRefineCostHistory?.length);
+    if (label) {
+        label.textContent = describeRoiBox(box, volume);
+    }
+}
+
+function toggleRoiBoxEdit() {
+    roiBoxEditMode = true;
+    const volume = buildCtGeometry();
+    const changed = ensureRoiRefineBox(volume);
+    if (changed && volume && roiRefineBox) focusToRoiBox(volume, roiRefineBox);
+    updateMrStatusText('VOI box edit: drag in any view to resize.');
+    updateRoiRefinementOptions();
+    displaySimpleViewer();
+}
+
+function resetRoiBox() {
+    const volume = buildCtGeometry();
+    const sel = chooseRegistrationForCurrentPair();
+    const baseMatrix = mrToCtMatrix || sel?.matrix || composeRegistrationTransforms(mrRegistration);
+    const initialBox = computeInitialRoiBox(volume, mrVolume, baseMatrix);
+    if (!volume) {
+        showMessage('error', 'Load CT before resetting VOI box.');
+        return;
+    }
+    if (initialBox) roiRefineBox = initialBox;
+    else initRoiRefineBoxFromVolume(volume);
+    mrRefinementDelta = { x: 0, y: 0, z: 0 };
+    mrRefinementRotDeg = 0;
+    mrRefinementRotVec = { x: 0, y: 0, z: 0 };
+    mrAcceptedRoiBox = null;
+    mrRefinementAccepted = false;
+    roiBoxEditMode = true;
+    roiBoxDrag = null;
+    updateRoiRefinementOptions();
+    displaySimpleViewer();
+    if (window.volumeData) {
+        renderSagittalView(window.volumeData, viewportState.sagittal.currentSliceX || Math.floor((volume?.width || 1) / 2));
+        renderCoronalView(window.volumeData, viewportState.coronal.currentSliceY || Math.floor((volume?.height || 1) / 2));
+    }
+}
+
+function buildPreviewBoxFromDrag(plane, startImg, endImg, volume) {
+    if (!volume || !startImg || !endImg) return null;
+    const base = roiBoxDrag?.startBox ? { ...roiBoxDrag.startBox } : (roiRefineBox ? { ...roiRefineBox } : initRoiRefineBoxFromVolume(volume, true) || {});
+    const s = convertViewPointToIndices(plane, startImg.dataX, startImg.dataY, volume);
+    const e = convertViewPointToIndices(plane, endImg.dataX, endImg.dataY, volume);
+    if (!s || !e) return null;
+    let adjusted = base;
+    if (roiBoxDrag?.mode === 'edge') {
+        adjusted = applyEdgeDrag(base, plane, e);
+    } else if (roiBoxDrag?.mode === 'move') {
+        adjusted = applyMoveDrag(base, plane, startImg, endImg, volume);
+    } else {
+        adjusted = applyDragToBox(base, plane, s, e);
+    }
+    return clampRoiBox(adjusted, volume);
+}
+
+function convertViewPointToIndices(plane, dataX, dataY, volume) {
+    if (!volume) return null;
+    const clamp = (v, min, max) => Math.max(min, Math.min(max, Math.round(v)));
+    if (plane === 'axial') {
+        return {
+            x: clamp(dataX, 0, volume.width - 1),
+            y: clamp(dataY, 0, volume.height - 1),
+            z: clamp(window.simpleViewerData?.currentSlice || 0, 0, volume.depth - 1)
+        };
+    }
+    if (plane === 'sagittal') {
+        const yIdx = clamp(dataX, 0, volume.height - 1);
+        const zIdx = clamp((volume.depth - 1) - dataY, 0, volume.depth - 1);
+        const xIdx = clamp(viewportState.sagittal.currentSliceX || Math.floor(volume.width / 2), 0, volume.width - 1);
+        return { x: xIdx, y: yIdx, z: zIdx };
+    }
+    if (plane === 'coronal') {
+        const xIdx = clamp(dataX, 0, volume.width - 1);
+        const zIdx = clamp((volume.depth - 1) - dataY, 0, volume.depth - 1);
+        const yIdx = clamp(viewportState.coronal.currentSliceY || Math.floor(volume.height / 2), 0, volume.height - 1);
+        return { x: xIdx, y: yIdx, z: zIdx };
+    }
+    return null;
+}
+
+function applyDragToBox(base, plane, s, e) {
+    if (!base || !s || !e) return base;
+    const min = (a, b) => Math.min(a, b);
+    const max = (a, b) => Math.max(a, b);
+    if (plane === 'axial') {
+        base.minX = min(s.x, e.x);
+        base.maxX = max(s.x, e.x);
+        base.minY = min(s.y, e.y);
+        base.maxY = max(s.y, e.y);
+        if (base.minZ === undefined || base.maxZ === undefined) {
+            base.minZ = base.maxZ = s.z;
+        }
+    } else if (plane === 'sagittal') {
+        base.minY = min(s.y, e.y);
+        base.maxY = max(s.y, e.y);
+        base.minZ = min(s.z, e.z);
+        base.maxZ = max(s.z, e.z);
+        if (base.minX === undefined || base.maxX === undefined) {
+            base.minX = base.maxX = s.x;
+        }
+    } else if (plane === 'coronal') {
+        base.minX = min(s.x, e.x);
+        base.maxX = max(s.x, e.x);
+        base.minZ = min(s.z, e.z);
+        base.maxZ = max(s.z, e.z);
+        if (base.minY === undefined || base.maxY === undefined) {
+            base.minY = base.maxY = s.y;
+        }
+    }
+    return base;
+}
+
+function applyEdgeDrag(base, plane, endIdx) {
+    if (!base || !endIdx) return base;
+    if (plane === 'axial') {
+        if (roiBoxDrag.edges?.x0) base.minX = endIdx.x;
+        if (roiBoxDrag.edges?.x1) base.maxX = endIdx.x;
+        if (roiBoxDrag.edges?.y0) base.minY = endIdx.y;
+        if (roiBoxDrag.edges?.y1) base.maxY = endIdx.y;
+    } else if (plane === 'sagittal') {
+        if (roiBoxDrag.edges?.x0) base.minY = endIdx.y;
+        if (roiBoxDrag.edges?.x1) base.maxY = endIdx.y;
+        if (roiBoxDrag.edges?.y0) base.maxZ = endIdx.z;
+        if (roiBoxDrag.edges?.y1) base.minZ = endIdx.z;
+    } else if (plane === 'coronal') {
+        if (roiBoxDrag.edges?.x0) base.minX = endIdx.x;
+        if (roiBoxDrag.edges?.x1) base.maxX = endIdx.x;
+        if (roiBoxDrag.edges?.y0) base.maxZ = endIdx.z;
+        if (roiBoxDrag.edges?.y1) base.minZ = endIdx.z;
+    }
+    return base;
+}
+
+function applyMoveDrag(base, plane, startData, endData, volume) {
+    if (!base || !startData || !endData || !volume) return base;
+    const dx = endData.dataX - startData.dataX;
+    const dy = endData.dataY - startData.dataY;
+    if (plane === 'axial') {
+        base.minX += dx; base.maxX += dx;
+        base.minY += dy; base.maxY += dy;
+    } else if (plane === 'sagittal') {
+        // sagittal data coords: X = Y axis, Y = flipped Z
+        base.minY += dx; base.maxY += dx;
+        base.minZ -= dy; base.maxZ -= dy;
+    } else if (plane === 'coronal') {
+        // coronal data coords: X = X axis, Y = flipped Z
+        base.minX += dx; base.maxX += dx;
+        base.minZ -= dy; base.maxZ -= dy;
+    }
+    return clampRoiBox(base, volume);
+}
+
+function setRoiBoxFromDrag(plane, startImg, endImg, volume) {
+    if (!volume || !startImg || !endImg) return;
+    const base = (roiBoxDrag?.startBox ? { ...roiBoxDrag.startBox } : (roiRefineBox ? { ...roiRefineBox } : initRoiRefineBoxFromVolume(volume, true) || {}));
+    const s = convertViewPointToIndices(plane, startImg.dataX, startImg.dataY, volume);
+    const e = convertViewPointToIndices(plane, endImg.dataX, endImg.dataY, volume);
+    if (!s || !e) return;
+    applyEdgeDrag(base, plane, e);
+    roiRefineBox = clampRoiBox(base, volume);
+    roiBoxEditMode = true;
+    updateRoiRefinementOptions();
+    displaySimpleViewer();
+    if (window.volumeData) {
+        renderSagittalView(window.volumeData, viewportState.sagittal.currentSliceX || Math.floor((volume?.width || 1) / 2));
+        renderCoronalView(window.volumeData, viewportState.coronal.currentSliceY || Math.floor((volume?.height || 1) / 2));
+    }
+}
+
+function scheduleRoiDragRedraw() {
+    if (roiDragThrottleTimer) return;
+    roiDragThrottleTimer = setTimeout(() => {
+        roiDragThrottleTimer = null;
+        displaySimpleViewer();
+    }, 40);
 }
 
 function extractROIColors(dataSet) {
@@ -2717,7 +4583,12 @@ function withDisplayTransform(ctx, displayParams, drawFn) {
     const scaleY = displayParams.displayHeight / displayParams.dataHeight;
     ctx.save();
     ctx.translate(displayParams.offsetX || 0, displayParams.offsetY || 0);
-    ctx.scale(scaleX, scaleY);
+    if (displayParams.flipX) {
+        ctx.translate(displayParams.displayWidth, 0);
+        ctx.scale(-scaleX, scaleY);
+    } else {
+        ctx.scale(scaleX, scaleY);
+    }
     drawFn();
     ctx.restore();
 }
@@ -2787,6 +4658,81 @@ function drawCrosshairCoronal(ctx, displayParams, volume) {
         ctx.moveTo(0, (height - 1 - zIndex) + 0.5);
         ctx.lineTo(width, (height - 1 - zIndex) + 0.5);
         ctx.stroke();
+        ctx.restore();
+    });
+}
+
+function drawRoiRefineBoxOverlay(ctx, plane, displayParams, volume) {
+    if (activeTab !== 'mr') return;
+    if (!ctx || !displayParams || !volume) return;
+    const refineOpen = document.getElementById('mrRoiRefineDetails')?.open || false;
+    if (!refineOpen) return;
+    let box = clampRoiBox(roiRefineBox, volume);
+    if (roiBoxEditMode && roiBoxDrag && roiBoxDrag.plane === plane && roiBoxDrag.start && roiBoxDrag.current) {
+        const preview = buildPreviewBoxFromDrag(plane, roiBoxDrag.start, roiBoxDrag.current, volume);
+        if (preview) box = preview;
+    }
+    if (!box) return;
+    // Show on intersecting slices; also paint on stack edges to label ROI
+    const zIdx = Math.round(window.simpleViewerData?.currentSlice ?? 0);
+    const xIdx = Math.round(viewportState.sagittal.currentSliceX ?? 0);
+    const yIdx = Math.round(viewportState.coronal.currentSliceY ?? 0);
+    const intersects = plane === 'axial'
+        ? (zIdx >= box.minZ && zIdx <= box.maxZ)
+        : plane === 'sagittal'
+            ? (xIdx >= box.minX && xIdx <= box.maxX)
+            : (yIdx >= box.minY && yIdx <= box.maxY);
+    const atStackEdge = plane === 'axial' && (zIdx === 0 || zIdx === volume.depth - 1);
+    if (!intersects && !atStackEdge) return;
+    let x0, y0, x1, y1;
+    if (plane === 'axial') {
+        x0 = box.minX;
+        x1 = box.maxX + 1;
+        y0 = box.minY;
+        y1 = box.maxY + 1;
+    } else if (plane === 'sagittal') {
+        x0 = box.minY;
+        x1 = box.maxY + 1;
+        y0 = (volume.depth - 1 - box.maxZ);
+        y1 = (volume.depth - 1 - box.minZ) + 1;
+    } else if (plane === 'coronal') {
+        x0 = box.minX;
+        x1 = box.maxX + 1;
+        y0 = (volume.depth - 1 - box.maxZ);
+        y1 = (volume.depth - 1 - box.minZ) + 1;
+    } else {
+        return;
+    }
+    const w = x1 - x0;
+    const h = y1 - y0;
+    withDisplayTransform(ctx, displayParams, () => {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,140,0,0.85)'; // orange VOI box during refinement
+        ctx.lineWidth = 2;
+        ctx.setLineDash([]);
+        if (atStackEdge && !intersects) {
+            // Label ROI on top/bottom slices with a light fill
+            ctx.fillStyle = 'rgba(255,140,0,0.12)';
+            ctx.fillRect(x0, y0, w, h);
+        }
+        ctx.strokeRect(x0, y0, w, h);
+        if (roiBoxEditMode && intersects) {
+            const handleSize = Math.max(4, Math.min(displayParams.dataWidth, displayParams.dataHeight) * 0.01);
+            const drawHandle = (hx, hy) => {
+                ctx.save();
+                ctx.fillStyle = 'rgba(255,140,0,0.9)';
+                ctx.fillRect(hx - handleSize/2, hy - handleSize/2, handleSize, handleSize);
+                ctx.restore();
+            };
+            drawHandle(x0, y0);
+            drawHandle(x1, y0);
+            drawHandle(x0, y1);
+            drawHandle(x1, y1);
+            drawHandle((x0 + x1) / 2, y0);
+            drawHandle((x0 + x1) / 2, y1);
+            drawHandle(x0, (y0 + y1) / 2);
+            drawHandle(x1, (y0 + y1) / 2);
+        }
         ctx.restore();
     });
 }
@@ -3269,7 +5215,8 @@ function stampFooterAnnotation(huData, width, height, roiEntries, delta = FOOTER
     }
     ctx.fillText(line1, margin, drawY);
     drawY += FOOTER_FONT_PX + lineGap;
-    ctx.fillText(line2, margin, drawY);
+    ctx.textAlign = 'right';
+    ctx.fillText(line2, canvas.width - margin, drawY);
 
     const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const data = img.data;
@@ -3289,7 +5236,7 @@ function stampFooterAnnotation(huData, width, height, roiEntries, delta = FOOTER
 }
 
 // Hard-burn a warning label at the top-left corner on every slice (or bottom if requested)
-function stampTopLeftWarning(huData, width, height, text = 'NOT VALIDATED FOR CLINICAL USE', topOffset = null, placeBottom = false) {
+function stampTopLeftWarning(huData, width, height, text = 'NOT VALIDATED FOR CLINICAL USE', topOffset = null, placeBottom = false, placeRight = false) {
     if (!text || !text.trim()) return;
 
     // Prepare a measuring canvas to size the final draw
@@ -3321,15 +5268,117 @@ function stampTopLeftWarning(huData, width, height, text = 'NOT VALIDATED FOR CL
     const startRow = placeBottom
         ? Math.max(0, height - canvasHeight - margin)
         : ((topOffset !== null && Number.isFinite(topOffset)) ? topOffset : 0);
+    const startCol = placeRight
+        ? Math.max(0, width - canvasWidth - margin)
+        : margin;
     for (let y = 0; y < canvasHeight; y++) {
         const py = startRow + y;
         if (py < 0 || py >= height) continue;
         const rowBase = py * width;
         for (let x = 0; x < canvasWidth; x++) {
+            const px = startCol + x;
+            if (px < 0 || px >= width) continue;
             const alpha = data[(y * canvasWidth + x) * 4 + 3];
             if (alpha < 128) continue;
-            const idx = rowBase + x;
+            const idx = rowBase + px;
             huData[idx] = clampHU(FOOTER_TEXT_HU);
+        }
+    }
+}
+
+function burnRoiOutline(huData, width, height, box, volume, opts = {}) {
+    if (!huData || !box || !volume) return;
+    const huVal = opts.hu || 1200;
+    const thick = Math.max(1, opts.thickness || 1);
+    const alpha = Math.max(0, Math.min(1, (opts.alpha !== undefined ? opts.alpha : 0.5)));
+    const boostFrac = Number.isFinite(opts.boostWindowFrac) ? opts.boostWindowFrac : 1.0; // default full window boost for visibility
+    const windowWidth = Math.max(1, (ctWindowRange?.max ?? 240) - (ctWindowRange?.min ?? -160));
+    const boostHU = windowWidth * boostFrac;
+    const dashed = opts.dashed || false;
+    const dashLen = 8;
+    const gapLen = 6;
+    const b = clampRoiBox(box, volume);
+    const volW = volume.width;
+    const volH = volume.height;
+    const depth = Math.max(1, volume.depth || 1);
+    const isVolumeData = huData.length >= volW * volH * depth;
+    const targetZ = typeof opts.sliceIndex === 'number'
+        ? Math.max(0, Math.min(volume.depth - 1, opts.sliceIndex))
+        : Math.max(0, Math.min(volume.depth - 1, Math.round(window.simpleViewerData?.currentSlice ?? b.minZ)));
+    const applyHu = (x, y) => {
+        const idx = isVolumeData ? (targetZ * volW * volH + y * volW + x) : (y * volW + x);
+        if (idx < 0 || idx >= huData.length) return;
+        const current = huData[idx];
+        const target = boostFrac ? (current + boostHU) : huVal;
+        huData[idx] = target * alpha + current * (1 - alpha);
+    };
+    const x0 = Math.max(0, Math.min(volW - 1, b.minX));
+    const x1 = Math.max(0, Math.min(volW - 1, b.maxX));
+    const y0 = Math.max(0, Math.min(volH - 1, b.minY));
+    const y1 = Math.max(0, Math.min(volH - 1, b.maxY));
+    const drawSegmentedLine = (points) => {
+        for (let t = 0; t < thick; t++) {
+            for (const [x, y] of points(t)) {
+                applyHu(x, y);
+            }
+        }
+    };
+    const fillZFaces = !!opts.fillZFaces && (targetZ === b.minZ || targetZ === b.maxZ);
+    if (fillZFaces) {
+        for (let y = y0; y <= y1; y++) {
+            for (let x = x0; x <= x1; x++) {
+                applyHu(x, y);
+            }
+        }
+    } else if (dashed) {
+        // top and bottom dashed
+        drawSegmentedLine((t) => {
+            const pts = [];
+            const yt = Math.min(volH - 1, y0 + t);
+            const yb = Math.max(0, y1 - t);
+            let x = x0;
+            while (x <= x1) {
+                for (let d = 0; d < dashLen && x + d <= x1; d++) pts.push([x + d, yt]);
+                x += dashLen + gapLen;
+            }
+            x = x0;
+            while (x <= x1) {
+                for (let d = 0; d < dashLen && x + d <= x1; d++) pts.push([x + d, yb]);
+                x += dashLen + gapLen;
+            }
+            return pts;
+        });
+        // left and right dashed
+        drawSegmentedLine((t) => {
+            const pts = [];
+            const xl = Math.min(volW - 1, x0 + t);
+            const xr = Math.max(0, x1 - t);
+            let y = y0;
+            while (y <= y1) {
+                for (let d = 0; d < dashLen && y + d <= y1; d++) pts.push([xl, y + d]);
+                y += dashLen + gapLen;
+            }
+            y = y0;
+            while (y <= y1) {
+                for (let d = 0; d < dashLen && y + d <= y1; d++) pts.push([xr, y + d]);
+                y += dashLen + gapLen;
+            }
+            return pts;
+        });
+    } else {
+        for (let t = 0; t < thick; t++) {
+            const yt = Math.min(volH - 1, y0 + t);
+            const yb = Math.max(0, y1 - t);
+            for (let x = x0; x <= x1; x++) {
+                applyHu(x, yt);
+                applyHu(x, yb);
+            }
+            const xl = Math.min(volW - 1, x0 + t);
+            const xr = Math.max(0, x1 - t);
+            for (let y = y0; y <= y1; y++) {
+                applyHu(xl, y);
+                applyHu(xr, y);
+            }
         }
     }
 }
@@ -3477,7 +5526,7 @@ function burnSlices(sourceSlices, burnInSettings, options = {}) {
         // Always stamp warnings and provenance on MR padded output
         if (options?.mrContext) {
             const { ctSeriesName, mrSeriesName } = options.mrContext;
-            stampTopLeftWarning(huData, width, height, 'NOT FOR DOSE CALCULATION');
+            stampTopLeftWarning(huData, width, height, 'NOT FOR DOSE CALCULATION', null, true, true);
             if (ctSeriesName || mrSeriesName) {
                 const lines = [
                     ctSeriesName ? `CT: ${ctSeriesName}` : '',
@@ -4229,6 +6278,10 @@ async function initializeSimpleViewer() {
 
 function getActiveSeries() {
     if (activeTab === 'mr') {
+        if (mrCompareActive && mrRefineBaselineResampled && mrRefineBaselineResampled.length) {
+            return mrRefineBaselineResampled;
+        }
+        if (mrManualRegMode) return Array.isArray(ctFiles) ? ctFiles : [];
         if (mrPreviewActive && Array.isArray(mrBlendedSlices) && mrBlendedSlices.length) return mrBlendedSlices;
         if (mrPreviewActive && Array.isArray(mrResampledSlices) && mrResampledSlices.length) return mrResampledSlices;
         return Array.isArray(ctFiles) ? ctFiles : [];
@@ -4410,9 +6463,78 @@ function getCrosshairScreenPoint(viewName) {
 function handleMouseDown(e, viewportName) {
     const state = viewportState[viewportName];
     const rect = e.target.getBoundingClientRect();
+    const currentX = e.clientX - rect.left;
+    const currentY = e.clientY - rect.top;
+    state.lastMouseX = currentX;
+    state.lastMouseY = currentY;
+    let handled = false;
+
+    const refineOpen = document.getElementById('mrRoiRefineDetails')?.open || false;
+    if (activeTab === 'mr' && refineOpen && roiBoxEditMode && e.button === 0) {
+        const img = screenToImageCoords(viewportName, currentX, currentY);
+        if (img) {
+            const volume = buildCtGeometry();
+            let edgeHit = volume ? detectRoiEdgeHitScreen(viewportName, currentX, currentY, volume) : null;
+            if (!edgeHit && volume) {
+                const tol = getEdgeTolerance(viewportName);
+                edgeHit = detectRoiEdgeHit(viewportName, img.dataX, img.dataY, volume, tol);
+            }
+            if (edgeHit) {
+                roiBoxDrag = {
+                    plane: viewportName,
+                    start: img,
+                    current: img,
+                    mode: 'edge',
+                    edges: edgeHit.edges,
+                    startBox: roiRefineBox ? { ...roiRefineBox } : null
+                };
+                e.target.style.cursor = getResizeCursor(edgeHit);
+                handled = true;
+            }
+            const inside = volume ? isPointInsideRoiScreen(viewportName, currentX, currentY, volume, 24) : false;
+            if (roiRefineBox && inside) {
+                roiBoxDrag = {
+                    plane: viewportName,
+                    start: img,
+                    current: img,
+                    mode: 'move',
+                    startBox: roiRefineBox ? { ...roiRefineBox } : null
+                };
+                e.target.style.cursor = ROI_HAND_CURSOR;
+                handled = true;
+            }
+        }
+    }
+
+    if (handled) return;
     
-    state.lastMouseX = e.clientX - rect.left;
-    state.lastMouseY = e.clientY - rect.top;
+    if (mrManualRegMode && (viewportName === 'axial' || viewportName === 'sagittal' || viewportName === 'coronal') && (e.button === 0 || e.button === 1)) {
+        const img = screenToImageCoords(viewportName, currentX, currentY);
+        const geom = window.viewGeom && window.viewGeom[viewportName];
+        const ctGeom = mrManualGeom || buildCtGeometry();
+        if (img && geom && ctGeom) {
+            const centerData = { x: (geom.dataWidth || 0) / 2, y: (geom.dataHeight || 0) / 2 };
+            const dx = img.dataX - centerData.x;
+            const dy = img.dataY - centerData.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const ringRadius = 0.35 * Math.min(geom.dataWidth || 1, geom.dataHeight || 1);
+            const mode = dist > ringRadius ? 'rotate' : 'translate';
+            const startAngle = Math.atan2(dy, dx);
+            mrManualDrag = {
+                plane: viewportName,
+                mode,
+                startScreen: { x: currentX, y: currentY },
+                startImg: img,
+                startOffset: { ...mrManualOffset },
+                startRotation: mrManualRotationRad,
+                centerData,
+                startAngle,
+                ctGeom
+            };
+            e.target.style.cursor = mode === 'rotate' ? 'crosshair' : 'grabbing';
+            return;
+        }
+    }
     
     if (e.button === 0 && e.shiftKey) {
         // Shift+Left: begin crosshair drag
@@ -4432,8 +6554,132 @@ function handleMouseDown(e, viewportName) {
 // Handle mouse move events
 function handleMouseMove(e, viewportName) {
     const state = viewportState[viewportName];
+    const refineOpen = document.getElementById('mrRoiRefineDetails')?.open || false;
+    if (activeTab === 'mr' && refineOpen && roiBoxEditMode && roiBoxDrag && roiBoxDrag.plane === viewportName) {
+        const rect = e.target.getBoundingClientRect();
+        const currentX = e.clientX - rect.left;
+        const currentY = e.clientY - rect.top;
+        const img = screenToImageCoords(viewportName, currentX, currentY);
+        if (img) {
+            roiBoxDrag.current = img;
+            const volume = buildCtGeometry();
+            if (volume && roiBoxDrag.mode === 'move') {
+                const base = roiBoxDrag.startBox ? { ...roiBoxDrag.startBox } : (roiRefineBox ? { ...roiRefineBox } : initRoiRefineBoxFromVolume(volume, true) || {});
+                roiRefineBox = applyMoveDrag(base, viewportName, roiBoxDrag.start, img, volume);
+                e.target.style.cursor = ROI_HAND_CURSOR;
+                // Avoid triggering heavy reflows: just mark throttled redraw
+                if (roiDragThrottleTimer) {
+                    // pending; let the scheduled paint handle it
+                } else {
+                    roiDragThrottleTimer = setTimeout(() => {
+                        roiDragThrottleTimer = null;
+                        displaySimpleViewer();
+                    }, 16);
+                }
+            } else if (volume && roiBoxDrag.mode === 'edge') {
+                // Live edge preview
+                const base = roiBoxDrag.startBox ? { ...roiBoxDrag.startBox } : (roiRefineBox ? { ...roiRefineBox } : initRoiRefineBoxFromVolume(volume, true) || {});
+                const eIdx = convertViewPointToIndices(viewportName, img.dataX, img.dataY, volume);
+                if (eIdx) {
+                    applyEdgeDrag(base, viewportName, eIdx);
+                    roiRefineBox = clampRoiBox(base, volume);
+                }
+                e.target.style.cursor = getResizeCursor({ edges: roiBoxDrag.edges });
+                scheduleRoiDragRedraw();
+            } else {
+                scheduleRoiDragRedraw();
+            }
+        }
+        return;
+    }
+    if (mrManualRegMode && mrManualDrag && mrManualDrag.plane === viewportName) {
+        const rect = e.target.getBoundingClientRect();
+        const currentX = e.clientX - rect.left;
+        const currentY = e.clientY - rect.top;
+        const currImg = screenToImageCoords(viewportName, currentX, currentY);
+        const startImg = mrManualDrag.startImg || screenToImageCoords(viewportName, mrManualDrag.startScreen.x, mrManualDrag.startScreen.y);
+        const geom = mrManualDrag.ctGeom || mrManualGeom || buildCtGeometry();
+        if (mrManualDrag.mode === 'rotate' && currImg && startImg) {
+            const a0 = mrManualDrag.startAngle || 0;
+            const a1 = Math.atan2(currImg.dataY - mrManualDrag.centerData.y, currImg.dataX - mrManualDrag.centerData.x);
+            let delta = a1 - a0;
+            if (delta > Math.PI) delta -= Math.PI * 2;
+            else if (delta < -Math.PI) delta += Math.PI * 2;
+            mrManualRotationRad = (mrManualDrag.startRotation || 0) + delta;
+            mrManualRegLocked = false;
+            mrManualAdjusted = hasManualAdjustment();
+            invalidateManualOverlayCache();
+            updateManualRegUI();
+            scheduleManualPreviewRebuild(false);
+            return;
+        }
+        if (currImg && startImg && geom) {
+            const rowVec = geom.rowCos.map(v => v * (geom.rowSpacing || 1));
+            const colVec = geom.colCos.map(v => v * (geom.colSpacing || 1));
+            const normVec = geom.normal.map(v => v * (geom.sliceSpacing || 1));
+            const dx = currImg.dataX - startImg.dataX;
+            const dy = currImg.dataY - startImg.dataY;
+            let deltaVec = [0, 0, 0];
+            if (mrManualDrag.plane === 'axial') {
+                deltaVec = [
+                    colVec[0] * dx + rowVec[0] * dy,
+                    colVec[1] * dx + rowVec[1] * dy,
+                    colVec[2] * dx + rowVec[2] * dy
+                ];
+            } else if (mrManualDrag.plane === 'sagittal') {
+                deltaVec = [
+                    rowVec[0] * dx - normVec[0] * dy,
+                    rowVec[1] * dx - normVec[1] * dy,
+                    rowVec[2] * dx - normVec[2] * dy
+                ];
+            } else if (mrManualDrag.plane === 'coronal') {
+                deltaVec = [
+                    colVec[0] * dx - normVec[0] * dy,
+                    colVec[1] * dx - normVec[1] * dy,
+                    colVec[2] * dx - normVec[2] * dy
+                ];
+            }
+            mrManualOffset = {
+                x: mrManualDrag.startOffset.x + deltaVec[0],
+                y: mrManualDrag.startOffset.y + deltaVec[1],
+                z: mrManualDrag.startOffset.z + deltaVec[2]
+            };
+            mrManualRegLocked = false;
+            mrManualAdjusted = hasManualAdjustment();
+            invalidateManualOverlayCache();
+            updateManualRegUI();
+            scheduleManualPreviewRebuild(false);
+        }
+        return;
+    }
     
-    if (!state.mouseDown && !state.rightMouseDown) return;
+    if (!state.mouseDown && !state.rightMouseDown) {
+        const volume = buildCtGeometry();
+        const refineOpen = document.getElementById('mrRoiRefineDetails')?.open || false;
+        if (activeTab === 'mr' && refineOpen && roiBoxEditMode && volume) {
+            const rect = e.target.getBoundingClientRect();
+            const currentX = e.clientX - rect.left;
+            const currentY = e.clientY - rect.top;
+            const img = screenToImageCoords(viewportName, currentX, currentY);
+            if (img) {
+                let edgeHit = detectRoiEdgeHitScreen(viewportName, currentX, currentY, volume);
+                if (!edgeHit) {
+                    const tol = getEdgeTolerance(viewportName);
+                    edgeHit = detectRoiEdgeHit(viewportName, img.dataX, img.dataY, volume, tol);
+                }
+                if (edgeHit) {
+                    e.target.style.cursor = getResizeCursor(edgeHit);
+                    return;
+                }
+                const inside = isPointInsideRoiScreen(viewportName, currentX, currentY, volume, 24);
+                if (inside) {
+                    e.target.style.cursor = ROI_HAND_CURSOR;
+                    return;
+                }
+            }
+        }
+        return;
+    }
     if (window.crosshairDrag && window.crosshairDrag.active && window.crosshairDrag.view === viewportName) {
         updateCrosshairFromMouse(viewportName, e);
         return;
@@ -4463,6 +6709,31 @@ function handleMouseMove(e, viewportName) {
 // Handle mouse up events
 function handleMouseUp(e, viewportName) {
     const state = viewportState[viewportName];
+    const refineOpen = document.getElementById('mrRoiRefineDetails')?.open || false;
+    if (activeTab === 'mr' && refineOpen && roiBoxEditMode && roiBoxDrag && roiBoxDrag.plane === viewportName) {
+        const rect = e.target.getBoundingClientRect();
+        const currentX = e.clientX - rect.left;
+        const currentY = e.clientY - rect.top;
+        const img = screenToImageCoords(viewportName, currentX, currentY);
+        const volume = buildCtGeometry();
+        if (img && volume) {
+            if (roiBoxDrag.mode === 'edge') {
+                setRoiBoxFromDrag(viewportName, roiBoxDrag.start, img, volume);
+            } else if (roiBoxDrag.mode === 'move') {
+                // Already applied during move; ensure clamp and refresh
+                roiRefineBox = clampRoiBox(roiRefineBox, volume);
+                displaySimpleViewer();
+            }
+        }
+        roiBoxDrag = null;
+        e.target.style.cursor = 'grab';
+        return;
+    }
+    if (mrManualRegMode && mrManualDrag && mrManualDrag.plane === viewportName) {
+        mrManualDrag = null;
+        e.target.style.cursor = 'grab';
+        return;
+    }
     
     if (state.mouseDown) {
         state.mouseDown = false;
@@ -4513,96 +6784,104 @@ function adjustWindowLevel(deltaX, deltaY) {
 }
 
 function displaySimpleViewer() {
-    if (DEBUG) console.log('displaySimpleViewer - ROI data check:', {
-        hasPatientMark: !!window.RTSSMarks,
-        numPatientMarks: window.RTSSMarks?.length,
-        hasRoiData: !!window.roiData,
-        numRois: window.roiData?.length
-    });
+    if (pendingDisplayRAF) return;
+    pendingDisplayRAF = requestAnimationFrame(() => {
+        pendingDisplayRAF = null;
+        if (DEBUG) console.log('displaySimpleViewer - ROI data check:', {
+            hasPatientMark: !!window.RTSSMarks,
+            numPatientMarks: window.RTSSMarks?.length,
+            hasRoiData: !!window.roiData,
+            numRois: window.roiData?.length
+        });
+        if (!window.simpleViewerData) return;
+        if (!ctFiles || ctFiles.length === 0) {
+            console.error('No CT files available to display');
+            return;
+        }
     
-    if (!ctFiles || ctFiles.length === 0) {
-        console.error('No CT files available to display');
-        return;
-    }
-    
-    const slice = window.simpleViewerData.currentSlice;
+    const slice = Math.max(0, Math.min(window.simpleViewerData.currentSlice || 0, (getActiveSeries()?.length || 1) - 1));
+    window.simpleViewerData.currentSlice = slice;
 
-    const series = getActiveSeries();
+        const series = getActiveSeries();
+        if (!series || !series.length) {
+            console.error('No series available to display');
+            return;
+        }
 
-    const ctData = series[slice];
+        const ctData = series[slice];
+        
+        if (!ctData) {
+            console.error('No CT data for slice:', slice);
+            return;
+        }
+        
+        if (!ctData.dataSet) {
+            console.error('CT data missing dataSet property');
+            return;
+        }
     
-    if (!ctData) {
-        console.error('No CT data for slice:', slice);
-        return;
-    }
     
-    if (!ctData.dataSet) {
-        console.error('CT data missing dataSet property');
-        return;
-    }
-    
-    
-    // Render to axial viewport canvas
-    const canvas = document.getElementById('viewport-axial');
-    if (!canvas) {
-        console.error('Canvas element not found');
-        return;
-    }
+        // Render to axial viewport canvas
+        const canvas = document.getElementById('viewport-axial');
+        if (!canvas) {
+            console.error('Canvas element not found');
+            return;
+        }
 
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const state = viewportState.axial;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        const state = viewportState.axial;
 
-    // Get image dimensions from dataset
-    let width = 512, height = 512;
-    if (ctData.dataSet) {
-        width = ctData.dataSet.uint16(Tag.Columns) || 512;
-        height = ctData.dataSet.uint16(Tag.Rows) || 512;
-    }
+        // Get image dimensions from dataset
+        let width = 512, height = 512;
+        if (ctData.dataSet) {
+            width = ctData.dataSet.uint16(Tag.Columns) || 512;
+            height = ctData.dataSet.uint16(Tag.Rows) || 512;
+        }
 
-    // Fit viewport and prepare canvas size
-    const container = canvas.parentElement;
-    const containerRect = container.getBoundingClientRect();
-    canvas.width = containerRect.width;
-    canvas.height = containerRect.height;
+        // Fit viewport and prepare canvas size
+        const container = canvas.parentElement;
+        const containerRect = container.getBoundingClientRect();
+        canvas.width = containerRect.width;
+        canvas.height = containerRect.height;
 
-    // Clear and set transforms (pan/zoom)
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.save();
-    ctx.translate(canvas.width / 2 + state.panX, canvas.height / 2 + state.panY);
-    ctx.scale(state.zoom, state.zoom);
-    ctx.translate(-canvas.width / 2, -canvas.height / 2);
+        // Clear and set transforms (pan/zoom)
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.save();
+        ctx.translate(canvas.width / 2 + state.panX, canvas.height / 2 + state.panY);
+        ctx.scale(state.zoom, state.zoom);
+        ctx.translate(-canvas.width / 2, -canvas.height / 2);
 
-    // Compute display rectangle preserving aspect ratio
-    const dataAspectRatio = height / width;
-    const viewportAspectRatio = canvas.height / canvas.width;
-    let displayWidth, displayHeight;
-    if (dataAspectRatio > viewportAspectRatio) {
-        displayHeight = canvas.height * 0.9;
-        displayWidth = displayHeight / dataAspectRatio;
-    } else {
-        displayWidth = canvas.width * 0.9;
-        displayHeight = displayWidth * dataAspectRatio;
-    }
-    const offsetX = (canvas.width - displayWidth) / 2;
-    const offsetY = (canvas.height - displayHeight) / 2;
-    
-    // Get pixel data element
-    let pixelData;
-    if (!ctData.dataSet.elements || !ctData.dataSet.elements.x7fe00010) {
-        console.error('No pixel data element found in dataSet');
-        return;
-    }
-    
-    const pixelDataElement = ctData.dataSet.elements.x7fe00010;
-    const offset = pixelDataElement.dataOffset;
-    const length = pixelDataElement.length;
-    
-    
-    // For processed data, use modifiedPixelData if available
-    if (ctData.modifiedPixelData) {
-        pixelData = ctData.modifiedPixelData;
-    } else if (ctData.byteArray) {
-        // Extract from byte array
+        // Compute display rectangle preserving aspect ratio
+        const dataAspectRatio = height / width;
+        const viewportAspectRatio = canvas.height / canvas.width;
+        let displayWidth, displayHeight;
+        if (dataAspectRatio > viewportAspectRatio) {
+            displayHeight = canvas.height * 0.9;
+            displayWidth = displayHeight / dataAspectRatio;
+        } else {
+            displayWidth = canvas.width * 0.9;
+            displayHeight = displayWidth * dataAspectRatio;
+        }
+        const offsetX = (canvas.width - displayWidth) / 2;
+        const offsetY = (canvas.height - displayHeight) / 2;
+        
+        // Get pixel data element
+        let pixelData;
+        if (!ctData.dataSet.elements || !ctData.dataSet.elements.x7fe00010) {
+            console.error('No pixel data element found in dataSet');
+            return;
+        }
+        
+        const pixelDataElement = ctData.dataSet.elements.x7fe00010;
+        const offset = pixelDataElement.dataOffset;
+        const length = pixelDataElement.length;
+        
+        
+        // For processed data, use modifiedPixelData if available
+        if (ctData.modifiedPixelData) {
+            pixelData = ctData.modifiedPixelData;
+        } else if (ctData.byteArray) {
+            // Extract from byte array
         try {
             pixelData = new Int16Array(ctData.byteArray.buffer, offset, length / 2);
         } catch (e) {
@@ -4716,7 +6995,15 @@ function displaySimpleViewer() {
         dataWidth: width,
         dataHeight: height
     };
+    const ctGeom = mrManualGeom || buildCtGeometry();
+    if (mrManualRegMode) {
+        drawManualRegistrationOverlay(ctx, 'axial', axialDisplay, { sliceIndex: slice, ctGeom });
+    }
     drawROIOverlayOnCanvas(ctx, ctData, slice, width, height, axialDisplay);
+    drawRegistrationGizmo(ctx, axialDisplay);
+    const volumeForBox = ctGeom;
+    ensureRoiRefineBox(ctGeom);
+    drawRoiRefineBoxOverlay(ctx, 'axial', axialDisplay, volumeForBox);
     // Draw crosshair
     drawCrosshairAxial(ctx, axialDisplay, width, height);
 
@@ -4745,6 +7032,236 @@ function displaySimpleViewer() {
         const seriesLen = getActiveSeries().length || 0;
         infoElement.innerHTML = `Slice: ${slice + 1}/${seriesLen}<br>WL: ${windowWidth}/${windowLevel}`;
     }
+    });
+}
+
+function drawManualRegistrationOverlay(ctx, plane, display, opts = {}) {
+    if (!mrManualRegMode || activeTab !== 'mr') return;
+    if (!mrSeries || !mrSeries.length || !ctFiles || !ctFiles.length) return;
+    const ctGeom = opts.ctGeom || buildCtGeometry();
+    if (!ctGeom || !ctGeom.rowCos || !ctGeom.colCos || !ctGeom.positions) return;
+    const regChoice = chooseRegistrationForCurrentPair();
+    const baseMatrix = regChoice?.matrix || mrToCtMatrix || composeRegistrationTransforms(mrRegistration);
+    if (!baseMatrix) return;
+    const matrixDir = document.querySelector('input[name="mrMatrixDir"]:checked')?.value || 'mrct';
+    const baseMrToCt = (matrixDir === 'mrct') ? baseMatrix : invertMatrix4(baseMatrix);
+    if (!baseMrToCt) return;
+    const mrToCt = applyManualAdjustmentsToMatrix(baseMrToCt, mrManualOffset, mrManualRotationRad, ctGeom);
+    const ctToMr = invertMatrix4(mrToCt);
+    if (!ctToMr) return;
+    mrVolume = mrVolume || buildVolumeFromSlices(mrSeries, 'MR');
+    if (!mrVolume) return;
+    const positions = ctGeom.positions || [];
+    const rowVec = ctGeom.rowCos.map(v => v * (ctGeom.rowSpacing || 1));
+    const colVec = ctGeom.colCos.map(v => v * (ctGeom.colSpacing || 1));
+
+    let dataWidth = ctGeom.width;
+    let dataHeight = ctGeom.height;
+    let fixedIndex = typeof opts.sliceIndex === 'number' ? opts.sliceIndex : 0;
+    let planeLabel = plane || 'axial';
+    if (planeLabel === 'sagittal') {
+        dataWidth = ctGeom.height;
+        dataHeight = ctGeom.depth;
+        fixedIndex = Math.max(0, Math.min(ctGeom.width - 1, typeof opts.sliceX === 'number' ? opts.sliceX : Math.floor(ctGeom.width / 2)));
+    } else if (planeLabel === 'coronal') {
+        dataWidth = ctGeom.width;
+        dataHeight = ctGeom.depth;
+        fixedIndex = Math.max(0, Math.min(ctGeom.height - 1, typeof opts.sliceY === 'number' ? opts.sliceY : Math.floor(ctGeom.height / 2)));
+    } else {
+        dataWidth = ctGeom.width;
+        dataHeight = ctGeom.height;
+        fixedIndex = Math.max(0, Math.min(ctGeom.depth - 1, typeof opts.sliceIndex === 'number' ? opts.sliceIndex : 0));
+    }
+
+    const mrRange = mrDefaultWindowRange || mrWindowRange || { min: -200, max: 800 };
+    const mrMin = Number.isFinite(mrRange.min) ? mrRange.min : -200;
+    const mrMax = Number.isFinite(mrRange.max) ? mrRange.max : 800;
+    const mrSpan = Math.max(1e-3, mrMax - mrMin);
+    const interpolation = document.getElementById('mrInterpolation')?.value || 'linear';
+    const overlayAlpha = Math.max(0.2, mrBlendFraction);
+    if (overlayAlpha <= 0) return;
+    const regKey = mrRegistration?.file?.name || mrRegistration?.dataSet?.string?.(Tag.SOPInstanceUID) || '';
+    if (!(mrManualOverlayCache instanceof Map)) mrManualOverlayCache = new Map();
+    const cacheKey = [
+        planeLabel,
+        fixedIndex,
+        mrManualOffset.x.toFixed(2),
+        mrManualOffset.y.toFixed(2),
+        mrManualOffset.z.toFixed(2),
+        (mrManualRotationRad || 0).toFixed(4),
+        mrBlendFraction.toFixed(2),
+        matrixDir,
+        regKey,
+        MANUAL_OVERLAY_SCALE
+    ].join('|');
+    const cached = mrManualOverlayCache.get(cacheKey);
+    if (cached) {
+        ctx.save();
+        ctx.globalAlpha = overlayAlpha;
+        ctx.drawImage(cached, display.offsetX, display.offsetY, display.displayWidth, display.displayHeight);
+        ctx.restore();
+        return;
+    }
+
+    const overlayCanvas = document.createElement('canvas');
+    const scaledWidth = Math.max(64, Math.round(dataWidth * MANUAL_OVERLAY_SCALE));
+    const scaledHeight = Math.max(64, Math.round(dataHeight * MANUAL_OVERLAY_SCALE));
+    overlayCanvas.width = scaledWidth;
+    overlayCanvas.height = scaledHeight;
+    const overlayCtx = overlayCanvas.getContext('2d');
+    if (!overlayCtx) return;
+    const overlayImage = overlayCtx.createImageData(scaledWidth, scaledHeight);
+    const overlayData = overlayImage.data;
+
+    if (planeLabel === 'axial') {
+        const pos = positions[fixedIndex] || positions[0] || [0, 0, 0];
+        for (let r = 0; r < scaledHeight; r++) {
+            const dataR = (r + 0.5) * (dataHeight / scaledHeight);
+            const rowBaseWorld = [
+                pos[0] + rowVec[0] * dataR,
+                pos[1] + rowVec[1] * dataR,
+                pos[2] + rowVec[2] * dataR
+            ];
+            for (let c = 0; c < scaledWidth; c++) {
+                const dataC = (c + 0.5) * (dataWidth / scaledWidth);
+                const world = [
+                    rowBaseWorld[0] + colVec[0] * dataC,
+                    rowBaseWorld[1] + colVec[1] * dataC,
+                    rowBaseWorld[2] + colVec[2] * dataC
+                ];
+                const mrWorld = applyMatrix4(ctToMr, world);
+                const vox = worldToVoxel(mrVolume, mrWorld);
+                if (!vox) continue;
+                const val = sampleVolume(mrVolume, vox.i, vox.j, vox.k, interpolation);
+                if (val === null || val === undefined) continue;
+                const clamped = Math.max(mrMin, Math.min(mrMax, val));
+                const gray = Math.max(0, Math.min(255, Math.round(((clamped - mrMin) / mrSpan) * 255)));
+                const idx = (r * scaledWidth + c) * 4;
+                overlayData[idx] = gray;
+                overlayData[idx + 1] = gray;
+                overlayData[idx + 2] = gray;
+                overlayData[idx + 3] = 255;
+            }
+        }
+    } else if (planeLabel === 'sagittal') {
+        for (let yDisp = 0; yDisp < scaledHeight; yDisp++) {
+            const dataY = (yDisp + 0.5) * (dataHeight / scaledHeight);
+            const zIdx = Math.round(ctGeom.depth - 1 - dataY);
+            if (zIdx < 0 || zIdx >= ctGeom.depth) continue;
+            const pos = positions[zIdx] || positions[0] || [0, 0, 0];
+            for (let xDisp = 0; xDisp < scaledWidth; xDisp++) {
+                const dataX = (xDisp + 0.5) * (dataWidth / scaledWidth);
+                if (dataX < 0 || dataX >= ctGeom.height) continue;
+                const world = [
+                    pos[0] + rowVec[0] * dataX + colVec[0] * fixedIndex,
+                    pos[1] + rowVec[1] * dataX + colVec[1] * fixedIndex,
+                    pos[2] + rowVec[2] * dataX + colVec[2] * fixedIndex
+                ];
+                const mrWorld = applyMatrix4(ctToMr, world);
+                const vox = worldToVoxel(mrVolume, mrWorld);
+                if (!vox) continue;
+                const val = sampleVolume(mrVolume, vox.i, vox.j, vox.k, interpolation);
+                if (val === null || val === undefined) continue;
+                const clamped = Math.max(mrMin, Math.min(mrMax, val));
+                const gray = Math.max(0, Math.min(255, Math.round(((clamped - mrMin) / mrSpan) * 255)));
+                const idx = (yDisp * scaledWidth + xDisp) * 4;
+                overlayData[idx] = gray;
+                overlayData[idx + 1] = gray;
+                overlayData[idx + 2] = gray;
+                overlayData[idx + 3] = 255;
+            }
+        }
+    } else if (planeLabel === 'coronal') {
+        for (let yDisp = 0; yDisp < scaledHeight; yDisp++) {
+            const dataY = (yDisp + 0.5) * (dataHeight / scaledHeight);
+            const zIdx = Math.round(ctGeom.depth - 1 - dataY);
+            if (zIdx < 0 || zIdx >= ctGeom.depth) continue;
+            const pos = positions[zIdx] || positions[0] || [0, 0, 0];
+            for (let xDisp = 0; xDisp < scaledWidth; xDisp++) {
+                const dataX = (xDisp + 0.5) * (dataWidth / scaledWidth);
+                const world = [
+                    pos[0] + rowVec[0] * fixedIndex + colVec[0] * dataX,
+                    pos[1] + rowVec[1] * fixedIndex + colVec[1] * dataX,
+                    pos[2] + rowVec[2] * fixedIndex + colVec[2] * dataX
+                ];
+                const mrWorld = applyMatrix4(ctToMr, world);
+                const vox = worldToVoxel(mrVolume, mrWorld);
+                if (!vox) continue;
+                const val = sampleVolume(mrVolume, vox.i, vox.j, vox.k, interpolation);
+                if (val === null || val === undefined) continue;
+                const clamped = Math.max(mrMin, Math.min(mrMax, val));
+                const gray = Math.max(0, Math.min(255, Math.round(((clamped - mrMin) / mrSpan) * 255)));
+                const idx = (yDisp * scaledWidth + xDisp) * 4;
+                overlayData[idx] = gray;
+                overlayData[idx + 1] = gray;
+                overlayData[idx + 2] = gray;
+                overlayData[idx + 3] = 255;
+            }
+        }
+    }
+
+    overlayCtx.putImageData(overlayImage, 0, 0);
+    ctx.save();
+    ctx.globalAlpha = overlayAlpha;
+    ctx.drawImage(overlayCanvas, display.offsetX, display.offsetY, display.displayWidth, display.displayHeight);
+    ctx.restore();
+    mrManualOverlayCache.set(cacheKey, overlayCanvas);
+}
+
+function drawRegistrationGizmo(ctx, display) {
+    if (!mrManualRegMode || activeTab !== 'mr') return;
+    const cx = display.offsetX + (display.displayWidth || 0) / 2;
+    const cy = display.offsetY + (display.displayHeight || 0) / 2;
+    const size = Math.max(1, Math.min(display.displayWidth || 0, display.displayHeight || 0));
+    const radius = Math.max(16, size * 0.18);
+    const arm = Math.max(12, radius * 0.65);
+    const aw = Math.max(5, radius * 0.08);
+    const ah = Math.max(4, radius * 0.06);
+    const color = '#ffcc00';
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Horizontal
+    ctx.beginPath();
+    ctx.moveTo(cx - arm, cy);
+    ctx.lineTo(cx + arm, cy);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx + arm, cy);
+    ctx.lineTo(cx + arm - aw, cy - ah);
+    ctx.lineTo(cx + arm - aw, cy + ah);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(cx - arm, cy);
+    ctx.lineTo(cx - arm + aw, cy - ah);
+    ctx.lineTo(cx - arm + aw, cy + ah);
+    ctx.closePath();
+    ctx.fill();
+    // Vertical
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - arm);
+    ctx.lineTo(cx, cy + arm);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - arm);
+    ctx.lineTo(cx - ah, cy - arm + aw);
+    ctx.lineTo(cx + ah, cy - arm + aw);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + arm);
+    ctx.lineTo(cx - ah, cy + arm - aw);
+    ctx.lineTo(cx + ah, cy + arm - aw);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
 }
 
 // Create volume data for MPR reconstruction
@@ -4949,8 +7466,8 @@ function renderSagittalView(volume, sliceX) {
         
         for (let y = 0; y < volume.height; y++) {
             const srcIdx = y * volume.width + sliceX;
-            // Correct orientation: flip vertically
-            const dstIdx = ((height - 1 - z) * width + y) * 4;
+            // Correct orientation: flip vertically and horizontally (view from patient left to right)
+            const dstIdx = ((height - 1 - z) * width + (width - 1 - y)) * 4;
             
             if (srcIdx < sliceData.length) {
                 const hu = sliceData[srcIdx] * volume.slope + volume.intercept;
@@ -4977,7 +7494,8 @@ function renderSagittalView(volume, sliceX) {
         offsetX, offsetY, displayWidth, displayHeight,
         dataWidth: width, dataHeight: height,
         canvasWidth: canvas.width, canvasHeight: canvas.height,
-        panX: state.panX, panY: state.panY, zoom: state.zoom
+        panX: state.panX, panY: state.panY, zoom: state.zoom,
+        flipX: true
     };
     const displayParams = {
         offsetX: offsetX,
@@ -4985,9 +7503,18 @@ function renderSagittalView(volume, sliceX) {
         displayWidth: displayWidth,
         displayHeight: displayHeight,
         dataWidth: width,
-        dataHeight: height
+        dataHeight: height,
+        flipX: true
     };
+    if (mrManualRegMode) {
+        const ctGeom = buildCtGeometry();
+        drawManualRegistrationOverlay(ctx, 'sagittal', displayParams, { sliceX, ctGeom });
+        drawRegistrationGizmo(ctx, displayParams);
+    }
     drawROIOverlaySagittal(ctx, volume, sliceX, displayParams);
+    const ctGeom = buildCtGeometry();
+    ensureRoiRefineBox(ctGeom);
+    drawRoiRefineBoxOverlay(ctx, 'sagittal', displayParams, ctGeom);
     // Crosshair: vertical at coronal Y, horizontal at axial Z
     drawCrosshairSagittal(ctx, displayParams, volume);
     
@@ -5114,7 +7641,15 @@ function renderCoronalView(volume, sliceY) {
         dataWidth: width,
         dataHeight: height
     };
+    if (mrManualRegMode) {
+        const ctGeom = buildCtGeometry();
+        drawManualRegistrationOverlay(ctx, 'coronal', displayParams, { sliceY, ctGeom });
+        drawRegistrationGizmo(ctx, displayParams);
+    }
     drawROIOverlayCoronal(ctx, volume, sliceY, displayParams);
+    const ctGeomCor = buildCtGeometry();
+    ensureRoiRefineBox(ctGeomCor);
+    drawRoiRefineBoxOverlay(ctx, 'coronal', displayParams, ctGeomCor);
     // Crosshair: vertical at sagittal X, horizontal at axial Z
     drawCrosshairCoronal(ctx, displayParams, volume);
     

@@ -779,7 +779,6 @@
             z-index: 10;
             line-height: 1.4;
         }
-        
         /* Burn-in Controls in 4th viewport */
         .burn-controls {
             width: 100%;
@@ -869,6 +868,42 @@
         
         .burn-controls .burn-button:hover {
             background: var(--accent-hover);
+        }
+
+        .primary-btn {
+            background: var(--accent-primary);
+            color: white;
+            border: 1px solid var(--accent-primary);
+            border-radius: 4px;
+            padding: 8px 12px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .primary-btn:hover {
+            background: var(--accent-hover);
+        }
+        .primary-btn.compact {
+            padding: 6px 10px;
+            font-size: 11px;
+        }
+        .secondary-btn {
+            background: var(--panel-bg);
+            color: var(--text-primary);
+            border: 1px solid var(--panel-border);
+            border-radius: 4px;
+            padding: 8px 12px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .secondary-btn:hover {
+            border-color: var(--accent-primary);
+            color: #ffffff;
+        }
+        .secondary-btn.compact {
+            padding: 6px 10px;
+            font-size: 11px;
         }
         
         .width-slider {
@@ -1125,6 +1160,28 @@
                             <label>Fusion Blend:</label>
                             <input type="range" id="mrBlendSlider" min="0" max="100" value="100" class="width-slider" oninput="onMrBlendChange(this.value)">
                             <span id="mrBlendValue">100% MR</span>
+                        </div>
+                        <div style="height:1px;background:var(--panel-border);margin:8px 0;display:none;" id="mrRefineDivider"></div>
+                        <div class="control-row" id="mrRoiRefineRow" style="display:none;flex-direction:column;align-items:stretch;gap:8px;">
+                            <details id="mrRoiRefineDetails">
+                                <summary class="section-header" style="margin:0;cursor:pointer;display:flex;align-items:center;gap:6px;">
+                                    <span id="mrRoiFoldIcon" aria-hidden="true">▸</span>
+                                    <span>Refine Registration (Beta)</span>
+                                </summary>
+                                <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:10px;">
+                                    <button class="secondary-btn compact" type="button" onclick="resetRoiBox()">Reset ROI</button>
+                                    <button class="primary-btn compact" type="button" id="mrRefineRegBtn" onclick="refineRegistrationInROI()">Calculate New Alignment</button>
+                                    <span id="mrRefineStatus" class="upload-hint" style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></span>
+                                </div>
+                                <canvas id="mrRefineCostPlot" style="width:100%;height:100px;background:rgba(255,255,255,0.03);border:1px solid var(--panel-border);border-radius:6px;margin-top:6px;"></canvas>
+                                <div class="upload-hint" id="mrRefineResultLabel" style="display:none;">Δ mm: — | Δ°: —</div>
+                                <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:6px;">
+                                    <button class="primary-btn compact" type="button" id="mrCompareBtn" onmousedown="holdRefineCompare(true)" onmouseup="holdRefineCompare(false)" onmouseleave="holdRefineCompare(false)" disabled>Compare</button>
+                                    <button class="primary-btn compact" type="button" id="mrAcceptRefineBtn" onclick="acceptRoiRefinement()" disabled>Accept</button>
+                                    <button class="secondary-btn compact" type="button" onclick="resetRegistrationToFile()">Reset Registration</button>
+                                </div>
+                                <div class="upload-hint" id="mrRoiBoxLabel" style="line-height:1.35;">Drag box edges/corners in any view to set the refinement ROI.</div>
+                            </details>
                         </div>
                     </div>
                 </div>
@@ -1522,5 +1579,18 @@ SOFTWARE LICENSE
       By using this software, you agree to the
       <a href="gate/VarianLUSLA.html" target="_blank" rel="noreferrer noopener" style="color: var(--accent-primary); text-decoration: none;">Varian Limited Use Software License Agreement</a>
     </div>
+    <div class="modal-overlay" id="mrRefineOverlay" style="display:none;backdrop-filter: blur(3px);">
+        <div style="background:rgba(0,0,0,0.85);border:1px solid var(--panel-border);border-radius:10px;padding:16px 20px;min-width:260px;max-width:340px;display:flex;flex-direction:column;gap:10px;align-items:flex-start;box-shadow:0 12px 32px rgba(0,0,0,0.45);">
+            <div style="display:flex;align-items:center;gap:10px;">
+                <div class="spinner" style="width:20px;height:20px;border:3px solid rgba(255,255,255,0.2);border-top-color:var(--accent-primary);border-radius:50%;animation: spin 1s linear infinite;"></div>
+                <div style="font-weight:600;">Calculating new alignment…</div>
+            </div>
+            <div id="mrRefineOverlayStatus" style="font-size:12px;color:var(--text-secondary);line-height:1.5;">Preparing…</div>
+            <div id="mrRefineOverlayMetrics" style="font-size:12px;color:var(--text-secondary);line-height:1.5;">Cost: — | Iter: —</div>
+        </div>
+    </div>
+    <style>
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    </style>
 </body>
 </html>
