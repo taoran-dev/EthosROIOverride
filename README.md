@@ -1,5 +1,5 @@
 [README.md](https://github.com/user-attachments/files/22365002/README.md)
-# ROI Override Tool (Non-Clinical)
+# CT Pixel Override Tool (Non-Clinical)
 
 Burn DICOM RTSTRUCT contours into CT image pixels to generate derived “annotation baked‑in” DICOM series for review or system ingestion. This repository provides a browser/Electron implementation (`roi_override.html` + `roi_override.js`) and a Python desktop alternative (`roi_override.py`).
 
@@ -15,7 +15,8 @@ Burn DICOM RTSTRUCT contours into CT image pixels to generate derived “annotat
 - ROI browser with show/hide and include/exclude for burn‑in.
   - Single‑click an ROI name to show/hide its overlay.
   - Double‑click an ROI name to navigate the views to its center.
-- MR Pad tab (v1.2): load CT + MR + rigid registration (REG) to resample MR into CT space, preview normalized MR pixels over CT, and export an MR-padded CT while preserving CT geometry/FOR.
+- MR Pad tab: load CT + MR + rigid registration (REG) to resample MR into CT space, preview MR pixels over CT, and export an MR-padded CT while preserving CT geometry/FOR.
+- Registration refinement (Beta): define a VOI box in any view, run MI-based alignment, compare/accept results, and apply manual fine-tune (translations and rotations).
 - Live preview when toggling “Include in burn‑in”:
   - White outline, accurate image‑pixel thickness.
   - Honors Solid/Dotted line style and Line Width.
@@ -76,6 +77,7 @@ For users in environments with software installation restrictions, please contac
 - Use the RT Structure panel to show/hide ROIs and toggle “Include in burn‑in”.
   - Single‑click ROI name = show/hide; 
   - Double-click ROI name = navigate view planes to ROI.
+- Crosshair: Shift+Left drag to move; right-click centers the crosshair.
 - Configure Burn‑In Controls:
   - Series Name
   - Line Width and Style (Solid/Dotted)
@@ -84,6 +86,21 @@ For users in environments with software installation restrictions, please contac
 - Export Mode:
   - Single ImageSet (combines selected ROIs) or Separate ImageSets (one per ROI)
 - Click “Burn & Export”. A ZIP will be downloaded with the modified DICOMs.
+
+## Viewer Orientation
+
+- Axial: scroll up moves superior.
+- Sagittal: scroll up moves patient right (left-to-right view).
+- Coronal: scroll up moves posterior.
+
+## MR Pad and Refinement
+
+- Load CT + MR + rigid registration (REG/SRO).
+- Preview MR in CT space and adjust blend.
+- Refine Registration (Beta): drag the orange VOI box edges/corners in any view to define the optimization region, then run Calculate New Alignment (MI-based).
+- Manual fine-tune: enter dx/dy/dz (mm) and pitch/roll/yaw (deg); press Enter or click away to apply.
+- Compare toggles baseline while held; Accept locks the refinement.
+- Export an MR-padded CT that preserves CT geometry/FOR while replacing overlapping pixels with MR.
 
 ## Preview Options
 

@@ -1477,9 +1477,12 @@
             <li>Click Burn & Export when satisfied with the preview.</li>
           </ol>
 
-          <h3>MR Pad (v1.2)</h3>
+          <h3>MR Pad and Refinement</h3>
           <ul>
-            <li>Switch to the MR Pad tab, load CT + MR + rigid registration (REG/SRO), then normalize MR and preview MR→CT.</li>
+            <li>Switch to the MR Pad tab, load CT + MR + rigid registration (REG/SRO), then preview MR→CT.</li>
+            <li>Refine Registration (Beta): drag the orange VOI box edges/corners in any view to define the optimization region, then click Calculate New Alignment.</li>
+            <li>Manual fine-tune: enter dx/dy/dz (mm) and pitch/roll/yaw (deg). Press Enter or click away to apply.</li>
+            <li>Compare toggles baseline while held; Accept locks the refinement.</li>
             <li>Export an MR-padded CT that preserves CT geometry/FOR while replacing overlapping pixels with MR.</li>
           </ul>
 
@@ -1488,8 +1491,9 @@
             <li>Pan: drag with left mouse</li>
             <li>Window/Level: right-drag horizontally/vertically</li>
             <li>Slice: mouse wheel or Slice slider</li>
-            <li>Center crosshair: click inside a viewport</li>
+            <li>Crosshair: Shift+Left drag to move, or right-click to center</li>
             <li>Jump to ROI: double-click its name</li>
+            <li>Scroll direction follows patient axes: axial up=superior, sagittal up=patient right, coronal up=posterior</li>
             <li>Preview Mode displays the in-memory burned pixels exactly as they will export; click Preview Off to return to original CT data.</li>
           </ul>
 
