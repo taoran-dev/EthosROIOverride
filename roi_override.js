@@ -147,6 +147,7 @@ let previewRestoreState = null;
 let previewRestoreToggle = null;
 let previewRegenTimer = null;
 let mrRefinementDelta = { x: 0, y: 0, z: 0 };
+let refinePreviewTimer = null;
 
 // Initialize refine fold icon and cost plot placeholder once DOM is ready
 window.addEventListener('DOMContentLoaded', () => {
@@ -1293,6 +1294,7 @@ function resetRegistrationToFile() {
     mrRefinementDelta = { x: 0, y: 0, z: 0 };
     mrRefinementAccepted = false;
     mrRefinementRotDeg = 0;
+    mrRefinementRotVec = { x: 0, y: 0, z: 0 };
     mrCompareActive = false;
     mrRefineBaselineResampled = null;
     mrRefineBaselineBlended = null;
@@ -1404,12 +1406,11 @@ function screenToImageCoords(viewName, screenX, screenY) {
     const baseY = ((screenY - cy - (geom.panY || 0)) / (geom.zoom || 1)) + cy;
     const scaleX = geom.displayWidth / geom.dataWidth;
     const scaleY = geom.displayHeight / geom.dataHeight;
-    let dataX = ((baseX - geom.offsetX) / scaleX) - 0.5;
-    const dataY = ((baseY - geom.offsetY) / scaleY) - 0.5;
-    if (geom.flipX) {
-        dataX = (geom.dataWidth - 1) - dataX;
-    }
-    return { dataX, dataY };
+    const rawX = ((baseX - geom.offsetX) / scaleX) - 0.5;
+    const rawY = ((baseY - geom.offsetY) / scaleY) - 0.5;
+    const dataX = geom.flipX ? (geom.dataWidth - 1 - rawX) : rawX;
+    const dataY = rawY;
+    return { dataX, dataY, rawX, rawY };
 }
 
 function getProjectedBoxForPlane(box, plane, volume) {
@@ -1439,6 +1440,15 @@ function detectRoiEdgeHit(plane, dataX, dataY, volume, tolerance = 8) {
     if (Math.abs(dataY - proj.y1) <= tolerance) edges.y1 = true;
     const hit = Object.keys(edges).length > 0;
     if (!hit) return null;
+    if (plane === 'sagittal' && window.viewGeom?.sagittal?.flipX) {
+        // Normalize to screen-space: left/right are swapped under horizontal flip
+        const swapped = {};
+        if (edges.x0) swapped.x1 = true;
+        if (edges.x1) swapped.x0 = true;
+        if (edges.y0) swapped.y0 = true;
+        if (edges.y1) swapped.y1 = true;
+        return { edges: swapped };
+    }
     return { edges };
 }
 
@@ -2787,7 +2797,7 @@ async function refineRegistrationInROI() {
         return mi + 0.05 * ncc;
     }
 
-    let best = { x: 0, y: 0, z: 0, rot: 0, score: -Infinity };
+    let best = { x: mrRefinementDelta?.x || 0, y: mrRefinementDelta?.y || 0, z: mrRefinementDelta?.z || 0, rot: 0, rotVec: { ...mrRefinementRotVec }, score: scoreDelta(mrRefinementDelta?.x || 0, mrRefinementDelta?.y || 0, mrRefinementDelta?.z || 0, 0, 1, null, mrRefinementRotVec || { x: 0, y: 0, z: 0 }) };
     let iterSincePlot = 0;
     const recordCost = (val) => {
         refineIter += 1;
@@ -3009,19 +3019,36 @@ function getCtVolumeCenterWorld(vol) {
         vol.origin[2] + vol.colCos[2] * cx + vol.rowCos[2] * cy + vol.normal[2] * cz
     ];
 }
-function applyDeltaRigid(mat, delta = { x: 0, y: 0, z: 0, rotDeg: 0, rotAxis: null }, vol = null, normal = null) {
+function applyDeltaRigid(mat, delta = { x: 0, y: 0, z: 0, rotDeg: 0, rotAxis: null, rotVec: null }, vol = null, normal = null) {
     if (!mat || mat.length !== 16) return mat;
-    const rotRad = (delta.rotDeg || 0) * Math.PI / 180;
     let out = applyDeltaTranslation(mat, delta);
-    if (Math.abs(rotRad) > 1e-6) {
-        const axis = delta.rotAxis || normal || vol?.normal || [0, 0, 1];
-        const anchor = getCtVolumeCenterWorld(vol);
-        const rot = rotationAroundAxisMatrix(axis, rotRad);
+    const anchor = getCtVolumeCenterWorld(vol);
+
+    const applyAxisRotation = (axisVec, deg) => {
+        if (!axisVec || !Array.isArray(axisVec) || axisVec.length !== 3) return;
+        const rad = (deg || 0) * Math.PI / 180;
+        if (Math.abs(rad) < 1e-6) return;
+        const rot = rotationAroundAxisMatrix(axisVec, rad);
         const tNeg = translationMatrix(-(anchor?.[0] || 0), -(anchor?.[1] || 0), -(anchor?.[2] || 0));
         const tPos = translationMatrix(anchor?.[0] || 0, anchor?.[1] || 0, anchor?.[2] || 0);
         const rotAboutAnchor = multiplyMatrix4(tPos, multiplyMatrix4(rot, tNeg));
         const composed = multiplyMatrix4(out, rotAboutAnchor);
         if (composed) out = composed;
+    };
+
+    if (delta.rotVec) {
+        const axisX = normalizeVec3(vol?.rowCos || [1, 0, 0]);
+        const axisY = normalizeVec3(vol?.colCos || [0, 1, 0]);
+        const axisZ = normalizeVec3(vol?.normal || normal || [0, 0, 1]);
+        applyAxisRotation(axisX, delta.rotVec.x || 0);
+        applyAxisRotation(axisY, delta.rotVec.y || 0);
+        applyAxisRotation(axisZ, delta.rotVec.z || 0);
+    } else {
+        const rotRad = (delta.rotDeg || 0) * Math.PI / 180;
+        if (Math.abs(rotRad) > 1e-6) {
+            const axis = delta.rotAxis || normal || vol?.normal || [0, 0, 1];
+            applyAxisRotation(axis, delta.rotDeg || 0);
+        }
     }
     return out;
 }
@@ -3411,6 +3438,35 @@ function describeRoiBox(box, volume) {
     return `VOI spans ${dx.toFixed(1)} × ${dy.toFixed(1)} × ${dz.toFixed(1)} mm (x/y/z).`;
 }
 
+function applyRefineDeltaToMatrix(rebuildPreview = false) {
+    const volume = buildCtGeometry();
+    const baseSel = chooseRegistrationForCurrentPair();
+    const baseMatrix = mrRefineBaselineMatrix || baseSel?.matrix || mrToCtMatrix || composeRegistrationTransforms(mrRegistration);
+    if (!baseMatrix || !volume) return;
+    if (!mrRefineBaselineMatrix) mrRefineBaselineMatrix = [...baseMatrix];
+    const rotVec = mrRefinementRotVec || { x: 0, y: 0, z: 0 };
+    mrToCtMatrix = applyDeltaRigid([...baseMatrix], {
+        x: mrRefinementDelta?.x || 0,
+        y: mrRefinementDelta?.y || 0,
+        z: mrRefinementDelta?.z || 0,
+        rotVec
+    }, volume);
+    window.volumeData = null;
+    const queuePreview = () => {
+        if (refinePreviewTimer) clearTimeout(refinePreviewTimer);
+        refinePreviewTimer = setTimeout(async () => {
+            refinePreviewTimer = null;
+            if (mrPreviewActive) {
+                try { await buildMRPreview(false); } catch (e) { console.warn('Refine preview rebuild failed', e); }
+            } else {
+                displaySimpleViewer();
+            }
+        }, 80);
+    };
+    if (rebuildPreview) queuePreview();
+    else displaySimpleViewer();
+}
+
 function updateRoiRefinementOptions() {
     const row = document.getElementById('mrRoiRefineRow');
     const refineBtn = document.getElementById('mrRefineRegBtn');
@@ -3453,6 +3509,16 @@ function updateRoiRefinementOptions() {
     if (label) {
         label.textContent = describeRoiBox(box, volume);
     }
+    const setVal = (id, val, digits = 2) => {
+        const el = document.getElementById(id);
+        if (el && Number.isFinite(val)) el.value = val.toFixed(digits);
+    };
+    setVal('mrRefineDxInput', mrRefinementDelta?.x ?? 0, 1);
+    setVal('mrRefineDyInput', mrRefinementDelta?.y ?? 0, 1);
+    setVal('mrRefineDzInput', mrRefinementDelta?.z ?? 0, 1);
+    setVal('mrRefineRxInput', mrRefinementRotVec?.x ?? 0, 1);
+    setVal('mrRefineRyInput', mrRefinementRotVec?.y ?? 0, 1);
+    setVal('mrRefineRzInput', mrRefinementRotVec?.z ?? 0, 1);
 }
 
 function toggleRoiBoxEdit() {
@@ -3491,6 +3557,25 @@ function resetRoiBox() {
     }
 }
 
+function handleRefineInputChange(kind, axis, rawVal) {
+    const val = parseFloat(rawVal);
+    if (!Number.isFinite(val)) return;
+    if (kind === 't') {
+        mrRefinementDelta = { ...mrRefinementDelta, [axis]: val };
+    } else if (kind === 'r') {
+        mrRefinementRotVec = { ...mrRefinementRotVec, [axis]: val };
+        mrRefinementRotDeg = Math.max(Math.abs(mrRefinementRotVec.x || 0), Math.abs(mrRefinementRotVec.y || 0), Math.abs(mrRefinementRotVec.z || 0));
+    }
+    mrRefinementAccepted = false;
+    applyRefineDeltaToMatrix(true);
+    updateRoiRefinementOptions();
+}
+
+function handleRefineInputKey(event, kind, axis) {
+    if (event.key !== 'Enter') return;
+    handleRefineInputChange(kind, axis, event.target.value);
+}
+
 function buildPreviewBoxFromDrag(plane, startImg, endImg, volume) {
     if (!volume || !startImg || !endImg) return null;
     const base = roiBoxDrag?.startBox ? { ...roiBoxDrag.startBox } : (roiRefineBox ? { ...roiRefineBox } : initRoiRefineBoxFromVolume(volume, true) || {});
@@ -3519,6 +3604,7 @@ function convertViewPointToIndices(plane, dataX, dataY, volume) {
         };
     }
     if (plane === 'sagittal') {
+        // dataX/dataY are view-space coords mapped to volume indices: X=Y axis, Y=Z axis (top=low Z)
         const yIdx = clamp(dataX, 0, volume.height - 1);
         const zIdx = clamp((volume.depth - 1) - dataY, 0, volume.depth - 1);
         const xIdx = clamp(viewportState.sagittal.currentSliceX || Math.floor(volume.width / 2), 0, volume.width - 1);
@@ -3573,8 +3659,15 @@ function applyEdgeDrag(base, plane, endIdx) {
         if (roiBoxDrag.edges?.y0) base.minY = endIdx.y;
         if (roiBoxDrag.edges?.y1) base.maxY = endIdx.y;
     } else if (plane === 'sagittal') {
-        if (roiBoxDrag.edges?.x0) base.minY = endIdx.y;
-        if (roiBoxDrag.edges?.x1) base.maxY = endIdx.y;
+        const flipX = !!window.viewGeom?.sagittal?.flipX;
+        if (flipX) {
+            // Screen-left maps to maxY, screen-right maps to minY
+            if (roiBoxDrag.edges?.x0) base.maxY = endIdx.y;
+            if (roiBoxDrag.edges?.x1) base.minY = endIdx.y;
+        } else {
+            if (roiBoxDrag.edges?.x0) base.minY = endIdx.y;
+            if (roiBoxDrag.edges?.x1) base.maxY = endIdx.y;
+        }
         if (roiBoxDrag.edges?.y0) base.maxZ = endIdx.z;
         if (roiBoxDrag.edges?.y1) base.minZ = endIdx.z;
     } else if (plane === 'coronal') {
@@ -3594,7 +3687,7 @@ function applyMoveDrag(base, plane, startData, endData, volume) {
         base.minX += dx; base.maxX += dx;
         base.minY += dy; base.maxY += dy;
     } else if (plane === 'sagittal') {
-        // sagittal data coords: X = Y axis, Y = flipped Z
+        // sagittal data coords: X = Y axis, Y = flipped Z (dataX already unflipped)
         base.minY += dx; base.maxY += dx;
         base.minZ -= dy; base.maxZ -= dy;
     } else if (plane === 'coronal') {
@@ -4753,37 +4846,22 @@ function updateCrosshairFromMouse(viewName, evt, centerOnly = false) {
     const geom = window.viewGeom[viewName];
     const state = viewportState[viewName];
     if (!geom || !state) return;
-    const cx = geom.canvasWidth / 2;
-    const cy = geom.canvasHeight / 2;
-
-    // Undo pan/zoom
-    const bx = (sx - cx - geom.panX) / geom.zoom + cx;
-    const by = (sy - cy - geom.panY) / geom.zoom + cy;
-    // Into image data coords
-    const scaleX = geom.displayWidth / geom.dataWidth;
-    const scaleY = geom.displayHeight / geom.dataHeight;
-    const dx = (bx - geom.offsetX) / scaleX;
-    const dy = (by - geom.offsetY) / scaleY;
+    const img = screenToImageCoords(viewName, sx, sy);
+    const volume = window.volumeData;
+    if (!img || !volume) return;
+    const idx = convertViewPointToIndices(viewName, img.dataX, img.dataY, volume);
+    if (!idx) return;
 
     if (viewName === 'axial') {
-        // dx -> X (sagittal), dy -> Y (coronal)
-        viewportState.sagittal.currentSliceX = clampIndex(Math.round(dx), 0, geom.dataWidth - 1);
-        viewportState.coronal.currentSliceY = clampIndex(Math.round(dy), 0, geom.dataHeight - 1);
+        viewportState.sagittal.currentSliceX = idx.x;
+        viewportState.coronal.currentSliceY = idx.y;
+        if (window.simpleViewerData) window.simpleViewerData.currentSlice = idx.z;
     } else if (viewName === 'sagittal') {
-        const volume = window.volumeData;
-        if (!volume) return;
-        // Sagittal data coords: width=Y, height=Z (flipped vertical)
-        const y = clampIndex(Math.round(dx), 0, volume.height - 1);
-        const z = clampIndex(Math.round(volume.depth - 1 - dy), 0, volume.depth - 1);
-        viewportState.coronal.currentSliceY = y;
-        if (window.simpleViewerData) window.simpleViewerData.currentSlice = z;
+        viewportState.coronal.currentSliceY = idx.y;
+        if (window.simpleViewerData) window.simpleViewerData.currentSlice = idx.z;
     } else if (viewName === 'coronal') {
-        const volume = window.volumeData;
-        if (!volume) return;
-        const x = clampIndex(Math.round(dx), 0, volume.width - 1);
-        const z = clampIndex(Math.round(volume.depth - 1 - dy), 0, volume.depth - 1);
-        viewportState.sagittal.currentSliceX = x;
-        if (window.simpleViewerData) window.simpleViewerData.currentSlice = z;
+        viewportState.sagittal.currentSliceX = idx.x;
+        if (window.simpleViewerData) window.simpleViewerData.currentSlice = idx.z;
     }
     displaySimpleViewer();
 }
@@ -6376,29 +6454,35 @@ function handleWheel(e, viewportName) {
         } else if (viewportName === 'sagittal') {
             // Navigate sagittal slice (X axis)
             const volume = window.volumeData;
-            if (volume) {
-                const delta = (e.deltaY < 0) ? 1 : -1; // wheel up -> +X
-                const currentX = viewportState.sagittal.currentSliceX || Math.floor(volume.width / 2);
-                const newX = Math.max(0, Math.min(volume.width - 1, currentX + delta));
-                // Update state and re-render both sagittal and coronal to sync crosshair
-                viewportState.sagittal.currentSliceX = newX;
-                renderSagittalView(volume, newX);
-                renderCoronalView(volume, viewportState.coronal.currentSliceY || Math.floor(volume.height / 2));
-            }
-        } else if (viewportName === 'coronal') {
-            // Navigate coronal slice (Y axis)
-            const volume = window.volumeData;
-            if (volume) {
-                const delta = (e.deltaY < 0) ? 1 : -1; // wheel up -> +Y
-                const currentY = viewportState.coronal.currentSliceY || Math.floor(volume.height / 2);
-                const newY = Math.max(0, Math.min(volume.height - 1, currentY + delta));
-                // Update state and re-render both coronal and sagittal to sync crosshair
-                viewportState.coronal.currentSliceY = newY;
-                renderCoronalView(volume, newY);
-                renderSagittalView(volume, viewportState.sagittal.currentSliceX || Math.floor(volume.width / 2));
-            }
+        if (volume) {
+            const delta = (e.deltaY < 0) ? 1 : -1; // wheel up -> +X
+            const currentX = viewportState.sagittal.currentSliceX || Math.floor(volume.width / 2);
+            const newX = Math.max(0, Math.min(volume.width - 1, currentX + delta));
+            // Update state and re-render both sagittal and coronal to sync crosshair
+            viewportState.sagittal.currentSliceX = newX;
+            renderSagittalView(volume, newX);
+            const corY = clampIndex(viewportState.coronal.currentSliceY || Math.floor(volume.height / 2), 0, volume.height - 1);
+            renderCoronalView(volume, corY);
+            if (window.simpleViewerData) window.simpleViewerData.currentSlice = clampIndex(window.simpleViewerData.currentSlice || 0, 0, volume.depth - 1);
+            displaySimpleViewer();
+        }
+    } else if (viewportName === 'coronal') {
+        // Navigate coronal slice (Y axis)
+        const volume = window.volumeData;
+        if (volume) {
+            const delta = (e.deltaY < 0) ? 1 : -1; // wheel up -> +Y
+            const currentY = viewportState.coronal.currentSliceY || Math.floor(volume.height / 2);
+            const newY = Math.max(0, Math.min(volume.height - 1, currentY + delta));
+            // Update state and re-render both coronal and sagittal to sync crosshair
+            viewportState.coronal.currentSliceY = newY;
+            renderCoronalView(volume, newY);
+            const sagX = clampIndex(viewportState.sagittal.currentSliceX || Math.floor(volume.width / 2), 0, volume.width - 1);
+            renderSagittalView(volume, sagX);
+            if (window.simpleViewerData) window.simpleViewerData.currentSlice = clampIndex(window.simpleViewerData.currentSlice || 0, 0, volume.depth - 1);
+            displaySimpleViewer();
         }
     }
+}
 }
 
 function clampZoom(z) {
@@ -6765,6 +6849,19 @@ function navigateSlice(delta) {
         const slider = document.getElementById('sliceSlider');
         if (slider) {
             slider.value = newSlice;
+        }
+
+        // Keep crosshair slices in sync across views
+        const volume = window.volumeData || buildCtGeometry();
+        if (volume) {
+            const clampedZ = clampIndex(newSlice, 0, volume.depth - 1);
+            const sagX = clampIndex(viewportState.sagittal.currentSliceX ?? Math.floor(volume.width / 2), 0, volume.width - 1);
+            const corY = clampIndex(viewportState.coronal.currentSliceY ?? Math.floor(volume.height / 2), 0, volume.height - 1);
+            viewportState.sagittal.currentSliceX = sagX;
+            viewportState.coronal.currentSliceY = corY;
+            // Trigger MPR re-render with updated crosshair
+            renderSagittalView(volume, sagX);
+            renderCoronalView(volume, corY);
         }
     }
 }

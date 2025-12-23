@@ -1175,6 +1175,21 @@
                                 </div>
                                 <canvas id="mrRefineCostPlot" style="width:100%;height:100px;background:rgba(255,255,255,0.03);border:1px solid var(--panel-border);border-radius:6px;margin-top:6px;"></canvas>
                                 <div class="upload-hint" id="mrRefineResultLabel" style="display:none;">Δ mm: — | Δ°: —</div>
+                                <div class="upload-hint" style="display:flex;flex-direction:column;gap:6px;">
+                                    <div style="font-weight:600;">Manual fine-tune</div>
+                                    <div style="display:flex;flex-wrap:nowrap;gap:6px;align-items:center;">
+                                        <span style="min-width:70px;">Δ mm (x/y/z)</span>
+                                        <input type="number" id="mrRefineDxInput" step="0.1" style="width:64px;" onkeydown="handleRefineInputKey(event,'t','x')" onblur="handleRefineInputChange('t','x', this.value)" aria-label="Translation X (mm)">
+                                        <input type="number" id="mrRefineDyInput" step="0.1" style="width:64px;" onkeydown="handleRefineInputKey(event,'t','y')" onblur="handleRefineInputChange('t','y', this.value)" aria-label="Translation Y (mm)">
+                                        <input type="number" id="mrRefineDzInput" step="0.1" style="width:64px;" onkeydown="handleRefineInputKey(event,'t','z')" onblur="handleRefineInputChange('t','z', this.value)" aria-label="Translation Z (mm)">
+                                    </div>
+                                    <div style="display:flex;flex-wrap:nowrap;gap:6px;align-items:center;">
+                                        <span style="min-width:70px;">Δ° (pitch/roll/yaw)</span>
+                                        <input type="number" id="mrRefineRxInput" step="0.1" style="width:64px;" onkeydown="handleRefineInputKey(event,'r','x')" onblur="handleRefineInputChange('r','x', this.value)" aria-label="Rotation X (deg)">
+                                        <input type="number" id="mrRefineRyInput" step="0.1" style="width:64px;" onkeydown="handleRefineInputKey(event,'r','y')" onblur="handleRefineInputChange('r','y', this.value)" aria-label="Rotation Y (deg)">
+                                        <input type="number" id="mrRefineRzInput" step="0.1" style="width:64px;" onkeydown="handleRefineInputKey(event,'r','z')" onblur="handleRefineInputChange('r','z', this.value)" aria-label="Rotation Z (deg)">
+                                    </div>
+                                </div>
                                 <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:6px;">
                                     <button class="primary-btn compact" type="button" id="mrCompareBtn" onmousedown="holdRefineCompare(true)" onmouseup="holdRefineCompare(false)" onmouseleave="holdRefineCompare(false)" disabled>Compare</button>
                                     <button class="primary-btn compact" type="button" id="mrAcceptRefineBtn" onclick="acceptRoiRefinement()" disabled>Accept</button>
