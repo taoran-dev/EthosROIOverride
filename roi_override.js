@@ -1680,12 +1680,6 @@ async function processMRPackage(files) {
     mrRefineHoldPrev = null;
     mrRefineHoldPrevSlices = null;
     mrRefineHoldPrevBlended = null;
-    mrCompareActive = false;
-    mrRefineBaselineResampled = null;
-    mrRefineBaselineBlended = null;
-    mrRefineHoldPrev = null;
-    mrRefineHoldPrevSlices = null;
-    mrRefineHoldPrevBlended = null;
     roiOverlapInitDone = false;
     roiRefineBox = null;
     roiBoxEditMode = true;
@@ -1701,7 +1695,6 @@ async function processMRPackage(files) {
     roiContoursSag = {};
     roiContoursCor = {};
     updateRoiRefinementOptions();
-    mrRefineBaselineMatrix = null;
 
     updateMrStatusText('Processing mixed CT/MR/REG files...');
     updateMRProgress(0, '');
@@ -2487,20 +2480,13 @@ async function resampleMRToCT() {
 
     const refineApplied = (mrRefinementAccepted && mrRefinementDelta && (Math.abs(mrRefinementDelta.x) > 1e-3 || Math.abs(mrRefinementDelta.y) > 1e-3 || Math.abs(mrRefinementDelta.z) > 1e-3 || Math.abs(mrRefinementRotDeg) > 0.05));
     // Stamp warnings and provenance directly into the MR-padded preview/export
-    const annotationLines = ['NOT FOR DOSE CALCULATION'];
     const ctName = ctSeriesMap?.[currentCTSeries?.seriesUID || '']?.desc || currentCTSeries?.seriesUID || 'CT';
     const mrName = mrSeriesMap?.[currentMRSeries?.seriesUID || '']?.desc || currentMRSeries?.seriesUID || 'MR';
-    const otherLines = [];
-    otherLines.push(`CT: ${ctName}`);
-    otherLines.push(`MR: ${mrName}`);
-    buildRegistrationAnnotationLines().forEach(line => otherLines.push(line));
+    const infoLines = getMrInfoLines(ctName, mrName, buildRegistrationAnnotationLines());
     resampled.forEach((slice, idx) => {
         const huTarget = slice?.huData;
         if (!huTarget) return;
-        otherLines.forEach((line, lineIdx) => {
-            const margin = FOOTER_MARGIN + lineIdx * (FOOTER_FONT_PX + 4);
-            stampTopLeftWarning(huTarget, width, height, line, margin, false, false);
-        });
+        stampMrInfoLines(huTarget, width, height, infoLines);
         // Place dose warning bottom-right and clinical warning bottom-left
         stampTopLeftWarning(huTarget, width, height, 'NOT FOR DOSE CALCULATION', null, true, true);
         stampTopLeftWarning(huTarget, width, height, 'NOT FOR CLINICAL USE', null, true, false);
@@ -3681,13 +3667,14 @@ function applyEdgeDrag(base, plane, endIdx) {
 
 function applyMoveDrag(base, plane, startData, endData, volume) {
     if (!base || !startData || !endData || !volume) return base;
-    const dx = endData.dataX - startData.dataX;
-    const dy = endData.dataY - startData.dataY;
+    let dx = (endData.rawX ?? endData.dataX) - (startData.rawX ?? startData.dataX);
+    const dy = (endData.rawY ?? endData.dataY) - (startData.rawY ?? startData.dataY);
     if (plane === 'axial') {
         base.minX += dx; base.maxX += dx;
         base.minY += dy; base.maxY += dy;
     } else if (plane === 'sagittal') {
-        // sagittal data coords: X = Y axis, Y = flipped Z (dataX already unflipped)
+        // sagittal data coords: X = Y axis, Y = flipped Z
+        if (window.viewGeom?.sagittal?.flipX) dx = -dx;
         base.minY += dx; base.maxY += dx;
         base.minZ -= dy; base.maxZ -= dy;
     } else if (plane === 'coronal') {
@@ -5364,6 +5351,24 @@ function stampTopLeftWarning(huData, width, height, text = 'NOT VALIDATED FOR CL
     }
 }
 
+function getMrInfoLines(ctName, mrName, extraLines = []) {
+    const lines = [];
+    if (ctName) lines.push(`CT: ${ctName}`);
+    if (mrName) lines.push(`MR: ${mrName}`);
+    if (Array.isArray(extraLines)) {
+        extraLines.forEach(line => { if (line) lines.push(line); });
+    }
+    return lines;
+}
+
+function stampMrInfoLines(huData, width, height, lines) {
+    if (!lines || !lines.length) return;
+    lines.forEach((line, idx) => {
+        const margin = FOOTER_MARGIN + idx * (FOOTER_FONT_PX + 4);
+        stampTopLeftWarning(huData, width, height, line, margin, false, false);
+    });
+}
+
 function burnRoiOutline(huData, width, height, box, volume, opts = {}) {
     if (!huData || !box || !volume) return;
     const huVal = opts.hu || 1200;
@@ -5605,16 +5610,8 @@ function burnSlices(sourceSlices, burnInSettings, options = {}) {
         if (options?.mrContext) {
             const { ctSeriesName, mrSeriesName } = options.mrContext;
             stampTopLeftWarning(huData, width, height, 'NOT FOR DOSE CALCULATION', null, true, true);
-            if (ctSeriesName || mrSeriesName) {
-                const lines = [
-                    ctSeriesName ? `CT: ${ctSeriesName}` : '',
-                    mrSeriesName ? `MR: ${mrSeriesName}` : ''
-                ].filter(Boolean);
-                lines.forEach((line, idx) => {
-                    const margin = FOOTER_MARGIN + idx * (FOOTER_FONT_PX + 4);
-                    stampTopLeftWarning(huData, width, height, line, margin);
-                });
-            }
+            const lines = getMrInfoLines(ctSeriesName, mrSeriesName);
+            stampMrInfoLines(huData, width, height, lines);
             stampTopLeftWarning(huData, width, height, 'NOT FOR CLINICAL USE', null, true);
         } else {
             // Legacy warning for RT burn flows
@@ -5965,6 +5962,23 @@ function buildSeriesDescriptionForExport() {
     const suffix = pairs.length ? ` | ${pairs.join(' | ')}` : ' | NoROI';
     return `${baseName}${suffix}`;
 }
+
+// Shared UID + string helpers for DICOM exports
+function makeUIDForLen(maxLen) {
+    let uid = `2.25.${Date.now()}${Math.floor(Math.random()*1e12)}`;
+    if (uid.length > maxLen) uid = uid.slice(0, maxLen);
+    while (uid.endsWith('.')) uid = uid.slice(0, -1);
+    if (uid.length < 3) uid = '2.25';
+    return uid;
+}
+
+function writeASCIIInto(byteArray, offset, maxLen, str, padNull = true) {
+    const bytes = Array.from(String(str)).map(ch => ch.charCodeAt(0));
+    const L = Math.min(maxLen, bytes.length);
+    for (let i = 0; i < maxLen; i++) byteArray[offset + i] = padNull ? 0x00 : 0x20;
+    for (let i = 0; i < L; i++) byteArray[offset + i] = bytes[i];
+}
+
 // Export modified DICOM files
 async function exportModifiedDICOM(processedCTs, options = {}) {
     updateStatus('Exporting modified DICOM files...');
@@ -5999,24 +6013,6 @@ async function exportModifiedDICOM(processedCTs, options = {}) {
     const frameLen = firstDS?.elements?.x00200052?.length || 64;
     const sopLen = firstDS?.elements?.x00080018?.length || 64;
     const descLen = firstDS?.elements?.x0008103e?.length || 64;
-
-    // Helper: generate numeric UID that fits into existing length
-    const makeUIDForLen = (maxLen) => {
-        let uid = `2.25.${Date.now()}${Math.floor(Math.random()*1e12)}`;
-        if (uid.length > maxLen) uid = uid.slice(0, maxLen);
-        while (uid.endsWith('.')) uid = uid.slice(0, -1);
-        // Ensure at least something valid
-        if (uid.length < 3) uid = '2.25';
-        // Make even length by trimming if needed (element storage will pad)
-        return uid;
-    };
-    const writeASCIIInto = (byteArray, offset, maxLen, str, padNull = true) => {
-        const bytes = Array.from(String(str)).map(ch => ch.charCodeAt(0));
-        const L = Math.min(maxLen, bytes.length);
-        // pad the field first
-        for (let i = 0; i < maxLen; i++) byteArray[offset + i] = padNull ? 0x00 : 0x20;
-        for (let i = 0; i < L; i++) byteArray[offset + i] = bytes[i];
-    };
 
     const newStudyUID = makeUIDForLen(studyLen);
     const newSeriesUID = makeUIDForLen(seriesLen);
@@ -6107,20 +6103,6 @@ async function exportMultipleSeriesToOneZip(seriesList) {
         const frameLen = firstDS?.elements?.x00200052?.length || 64;
         const sopLen = firstDS?.elements?.x00080018?.length || 64;
         const descLen = firstDS?.elements?.x0008103e?.length || 64;
-
-        const makeUIDForLen = (maxLen) => {
-            let uid = `2.25.${Date.now()}${Math.floor(Math.random()*1e12)}`;
-            if (uid.length > maxLen) uid = uid.slice(0, maxLen);
-            while (uid.endsWith('.')) uid = uid.slice(0, -1);
-            if (uid.length < 3) uid = '2.25';
-            return uid;
-        };
-        const writeASCIIInto = (byteArray, offset, maxLen, str, padNull = true) => {
-            const bytes = Array.from(String(str)).map(ch => ch.charCodeAt(0));
-            const L = Math.min(maxLen, bytes.length);
-            for (let i = 0; i < maxLen; i++) byteArray[offset + i] = padNull ? 0x00 : 0x20;
-            for (let i = 0; i < L; i++) byteArray[offset + i] = bytes[i];
-        };
 
         const newStudyUID = makeUIDForLen(studyLen);
         const newSeriesUID = makeUIDForLen(seriesLen);
@@ -6409,6 +6391,55 @@ function setupViewportInteractions() {
     });
 }
 
+const PATIENT_AXES = {
+    left: [1, 0, 0],
+    right: [-1, 0, 0],
+    posterior: [0, 1, 0],
+    anterior: [0, -1, 0],
+    superior: [0, 0, 1],
+    inferior: [0, 0, -1]
+};
+
+function getVolumeOrientationAxes(volume) {
+    if (!volume) return null;
+    let rowCos = null;
+    let colCos = null;
+    if (Array.isArray(volume.rowCos) && volume.rowCos.length === 3 &&
+        Array.isArray(volume.colCos) && volume.colCos.length === 3) {
+        rowCos = volume.rowCos;
+        colCos = volume.colCos;
+    } else if (Array.isArray(volume.imageOrientation) && volume.imageOrientation.length >= 6) {
+        rowCos = volume.imageOrientation.slice(0, 3);
+        colCos = volume.imageOrientation.slice(3, 6);
+    }
+    if (!rowCos || !colCos) return null;
+    const row = normalizeVec3(rowCos);
+    const col = normalizeVec3(colCos);
+    const normal = normalizeVec3(cross3(row, col));
+    return { rowCos: row, colCos: col, normal };
+}
+
+function getSliceScrollSign(viewName, volume) {
+    const axes = getVolumeOrientationAxes(volume);
+    if (!axes) return 1;
+    let axisDir = null;
+    let desiredDir = null;
+    if (viewName === 'axial') {
+        axisDir = axes.normal;
+        desiredDir = PATIENT_AXES.superior; // feet -> head
+    } else if (viewName === 'sagittal') {
+        axisDir = axes.rowCos; // volume X
+        desiredDir = PATIENT_AXES.right; // patient left -> right
+    } else if (viewName === 'coronal') {
+        axisDir = axes.colCos; // volume Y
+        desiredDir = PATIENT_AXES.posterior; // anterior -> posterior
+    }
+    if (!axisDir || !desiredDir) return 1;
+    const d = dot3(axisDir, desiredDir);
+    if (!Number.isFinite(d) || d === 0) return 1;
+    return d > 0 ? 1 : -1;
+}
+
 // Handle mouse wheel events
 function handleWheel(e, viewportName) {
     e.preventDefault();
@@ -6449,13 +6480,16 @@ function handleWheel(e, viewportName) {
         
         // Navigate based on which viewport was scrolled
         if (viewportName === 'axial') {
-            const delta = wheelUp ? 1 : -1;
+            const geom = window.volumeData || buildCtGeometry();
+            const sign = getSliceScrollSign('axial', geom);
+            const delta = wheelUp ? sign : -sign;
             navigateSlice(delta);
         } else if (viewportName === 'sagittal') {
             // Navigate sagittal slice (X axis)
             const volume = window.volumeData;
         if (volume) {
-            const delta = (e.deltaY < 0) ? 1 : -1; // wheel up -> +X
+            const sign = getSliceScrollSign('sagittal', volume);
+            const delta = wheelUp ? sign : -sign; // wheel up -> patient right
             const currentX = viewportState.sagittal.currentSliceX || Math.floor(volume.width / 2);
             const newX = Math.max(0, Math.min(volume.width - 1, currentX + delta));
             // Update state and re-render both sagittal and coronal to sync crosshair
@@ -6470,7 +6504,8 @@ function handleWheel(e, viewportName) {
         // Navigate coronal slice (Y axis)
         const volume = window.volumeData;
         if (volume) {
-            const delta = (e.deltaY < 0) ? 1 : -1; // wheel up -> +Y
+            const sign = getSliceScrollSign('coronal', volume);
+            const delta = wheelUp ? sign : -sign; // wheel up -> posterior
             const currentY = viewportState.coronal.currentSliceY || Math.floor(volume.height / 2);
             const newY = Math.max(0, Math.min(volume.height - 1, currentY + delta));
             // Update state and re-render both coronal and sagittal to sync crosshair
@@ -6561,7 +6596,9 @@ function handleMouseDown(e, viewportName) {
             let edgeHit = volume ? detectRoiEdgeHitScreen(viewportName, currentX, currentY, volume) : null;
             if (!edgeHit && volume) {
                 const tol = getEdgeTolerance(viewportName);
-                edgeHit = detectRoiEdgeHit(viewportName, img.dataX, img.dataY, volume, tol);
+                const hitX = img.dataX;
+                const hitY = img.dataY;
+                edgeHit = detectRoiEdgeHit(viewportName, hitX, hitY, volume, tol);
             }
             if (edgeHit) {
                 roiBoxDrag = {
@@ -6749,7 +6786,9 @@ function handleMouseMove(e, viewportName) {
                 let edgeHit = detectRoiEdgeHitScreen(viewportName, currentX, currentY, volume);
                 if (!edgeHit) {
                     const tol = getEdgeTolerance(viewportName);
-                    edgeHit = detectRoiEdgeHit(viewportName, img.dataX, img.dataY, volume, tol);
+                    const hitX = img.dataX;
+                    const hitY = img.dataY;
+                    edgeHit = detectRoiEdgeHit(viewportName, hitX, hitY, volume, tol);
                 }
                 if (edgeHit) {
                     e.target.style.cursor = getResizeCursor(edgeHit);
